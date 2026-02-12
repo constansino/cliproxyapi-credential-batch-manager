@@ -16,11 +16,11 @@
 ### 1) Repository Mode（推荐）
 管理 Git 仓库中的凭证文件（适合集中管理“云端凭证仓库”）。
 
-- 输入：`--repo-url`（可选 `--git-key`）
+- 输入：`--repo-url`（可选 `--git-token`）
 - 输出：检测报告；可按状态删除并执行 `git commit` / `git push`
 
 ### 2) CPA API Mode
-通过 CPA 管理接口远程管理服务器当前加载的凭证（无需 SSH）。
+通过 CPA 管理接口远程管理服务器当前加载的凭证。
 
 - 输入：`--cpa-url` + `--management-key`
 - 输出：检测报告；可按状态调用 CPA 删除凭证
@@ -66,8 +66,8 @@ cliproxy-credman --help
 
 ```bash
 PYTHONPATH=src python3 -m cliproxy_credman \
-  --repo-url git@github.com:your-org/your-auth-repo.git \
-  --git-key ~/.ssh/id_ed25519 \
+  --repo-url https://github.com/your-org/your-auth-repo.git \
+  --git-token YOUR_GIT_TOKEN \
   --interactive \
   --report-file ./repo_report.json
 ```
@@ -110,8 +110,8 @@ PYTHONPATH=src python3 -m cliproxy_credman \
 
 ```bash
 PYTHONPATH=src python3 -m cliproxy_credman \
-  --repo-url git@github.com:your-org/your-auth-repo.git \
-  --git-key ~/.ssh/id_ed25519 \
+  --repo-url https://github.com/your-org/your-auth-repo.git \
+  --git-token YOUR_GIT_TOKEN \
   --schedule-minutes 30 \
   --tg-bot-token 123456:ABCDEF_xxx \
   --tg-chat-id -1001234567890 \
@@ -135,25 +135,26 @@ PYTHONPATH=src python3 -m cliproxy_credman \
   --report-file ./repo_report.json
 ```
 
-#### 私有仓库（SSH Key）
+#### 私有仓库（Git Token）
 
 ```bash
-chmod 600 ~/.ssh/id_ed25519
-ssh -T git@github.com
-
 PYTHONPATH=src python3 -m cliproxy_credman \
-  --repo-url git@github.com:your-org/your-auth-repo.git \
+  --repo-url https://github.com/your-org/your-auth-repo.git \
   --repo-branch master \
-  --git-key ~/.ssh/id_ed25519 \
+  --git-token YOUR_GIT_TOKEN \
   --report-file ./repo_report.json
 ```
+
+可选：
+- `--git-token-user`（默认 `x-access-token`）
+- 或通过环境变量 `GIT_TOKEN` 提供 token
 
 #### 非交互删除 + 推送
 
 ```bash
 PYTHONPATH=src python3 -m cliproxy_credman \
-  --repo-url git@github.com:your-org/your-auth-repo.git \
-  --git-key ~/.ssh/id_ed25519 \
+  --repo-url https://github.com/your-org/your-auth-repo.git \
+  --git-token YOUR_GIT_TOKEN \
   --delete-statuses invalidated,deactivated,expired_by_time,unauthorized \
   --git-commit \
   --git-push \
@@ -197,7 +198,7 @@ PYTHONPATH=src python3 -m cliproxy_credman \
 ## 参数
 
 - 输入模式：
-  - `--repo-url` / `--repo-branch` / `--git-key`
+  - `--repo-url` / `--repo-branch` / `--git-token` / `--git-token-user`
   - `--cpa-url` / `--management-key`
   - `--auth-dir`
 - 执行控制：

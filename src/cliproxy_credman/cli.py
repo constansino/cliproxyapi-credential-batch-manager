@@ -44,7 +44,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--auth-dir", help="Local auth directory with JSON files")
     parser.add_argument("--repo-url", help="Git repository URL containing auth files")
     parser.add_argument("--repo-branch", default="master", help="Git branch to use")
-    parser.add_argument("--git-key", help="SSH private key path")
+    parser.add_argument("--git-token", default=os.getenv("GIT_TOKEN", ""), help="Git access token (or env GIT_TOKEN)")
+    parser.add_argument("--git-token-user", default="x-access-token", help="Git token username for https URL")
     parser.add_argument("--workdir", help="Working directory for cloned repository")
     parser.add_argument("--auth-subdir", default="auths", help="Auth dir under repository")
     parser.add_argument("--timeout", type=int, default=35, help="HTTP timeout seconds")
@@ -76,12 +77,27 @@ def run_command(command: List[str], cwd: Optional[Path] = None, env: Optional[Di
     return completed.stdout.strip()
 
 
-def build_git_env(git_key: Optional[str]) -> Dict[str, str]:
-    environment = dict(os.environ)
-    if git_key:
-        key_path = str(Path(git_key).expanduser().resolve())
-        environment["GIT_SSH_COMMAND"] = f"ssh -i {key_path} -o StrictHostKeyChecking=accept-new"
-    return environment
+def build_git_env() -> Dict[str, str]:
+    return dict(os.environ)
+
+
+def build_repo_url_with_token(repo_url: str, git_token: str, token_user: str) -> str:
+    repo_url = (repo_url or "").strip()
+    token = (git_token or "").strip()
+    user = (token_user or "x-access-token").strip()
+    if not token:
+        return repo_url
+    if not repo_url.startswith("https://"):
+        raise ValueError("--git-token currently requires https repo URL")
+
+    parsed = urllib.parse.urlparse(repo_url)
+    host = parsed.hostname or ""
+    if not host:
+        return repo_url
+    port_part = f":{parsed.port}" if parsed.port else ""
+    netloc = f"{user}:{urllib.parse.quote(token, safe='')}@{host}{port_part}"
+    rebuilt = parsed._replace(netloc=netloc)
+    return urllib.parse.urlunparse(rebuilt)
 
 
 def prepare_auth_dir(args: argparse.Namespace) -> Tuple[Path, bool, Optional[Path], Optional[Dict[str, str]]]:
@@ -94,7 +110,7 @@ def prepare_auth_dir(args: argparse.Namespace) -> Tuple[Path, bool, Optional[Pat
             raise ValueError(f"auth dir not found: {auth_dir}")
         return auth_dir, False, None, None
 
-    git_env = build_git_env(args.git_key)
+    git_env = build_git_env()
     if args.workdir:
         workdir = Path(args.workdir).expanduser().resolve()
         workdir.mkdir(parents=True, exist_ok=True)
@@ -107,6 +123,8 @@ def prepare_auth_dir(args: argparse.Namespace) -> Tuple[Path, bool, Optional[Pat
     if repo_dir.exists():
         shutil.rmtree(repo_dir)
 
+    clone_repo_url = build_repo_url_with_token(args.repo_url, args.git_token, args.git_token_user)
+
     run_command(
         [
             "git",
@@ -114,7 +132,7 @@ def prepare_auth_dir(args: argparse.Namespace) -> Tuple[Path, bool, Optional[Pat
             "--single-branch",
             "--branch",
             args.repo_branch,
-            args.repo_url,
+            clone_repo_url,
             str(repo_dir),
         ],
         env=git_env,
@@ -696,9 +714,10 @@ def apply_menu_configuration(args: argparse.Namespace) -> argparse.Namespace:
     args.auth_dir = None
 
     if mode == "1":
-        args.repo_url = prompt_input("输入 repo URL")
+        args.repo_url = prompt_input("输入 repo URL（https）")
         args.repo_branch = prompt_input("输入分支", args.repo_branch or "master")
-        args.git_key = prompt_input("输入 SSH key 路径（私有仓库建议填写）", args.git_key or "") or None
+        args.git_token = prompt_input("输入 Git Token（私有仓库建议填写）", args.git_token or "")
+        args.git_token_user = prompt_input("Git Token 用户名", args.git_token_user or "x-access-token")
         args.auth_subdir = prompt_input("仓库内凭证目录", args.auth_subdir or "auths")
     elif mode == "2":
         args.cpa_url = prompt_input("输入 CPA URL（例如 http://127.0.0.1:8317）")
