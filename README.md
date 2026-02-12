@@ -1,79 +1,167 @@
-# CPA 凭证批量管理工具
+# CPA 凭证批量管理工具（CLIProxyAPI Credential Batch Manager）
 
-这是一个独立开源 CLI，用于批量管理 CLIProxyAPI（简称 CPA）的登录凭证。
-
-核心目标：
-- **本地凭证管理**：在运行 CPA 的服务器上直接执行。
-- **云端凭证管理（重点）**：在任意机器执行，通过 CPA 管理接口远程批量检测/删除，**不需要 SSH**。
+一个专门用于 **CLIProxyAPI 凭证批量检测与清理** 的开源 CLI 工具。
 
 ---
 
-## 设计思路（按你的要求）
+## 先说明：两种“云端”不是一回事
 
-本工具优先复用 CPA 的核心管理能力：
-- `GET /v0/management/auth-files` 获取凭证列表
-- `POST /v0/management/api-call` 让 CPA 按 `auth_index` 代入 `$TOKEN$` 去实测上游
-- `DELETE /v0/management/auth-files?name=...` 删除失效/封号凭证
+很多人会混淆，这里先讲清楚：
 
-所以“管理云端凭证”场景下，你只要能访问 CPA 端口和管理密钥即可，任何机器都能跑。
+### A. 云端 **Git 仓库凭证**（你说的主推场景）
+- 凭证保存在 GitHub/GitLab 仓库（例如 `auths/*.json`）
+- 你希望在任意机器拉取仓库后批量检测，然后删除失效凭证并提交推送
+- 对应本工具模式：`--repo-url`（可配 `--git-key`）
+
+### B. 云端服务器上 CPA 的 **本地凭证目录**
+- 凭证在服务器上 CPA 本地目录（例如容器内/挂载目录）
+- 你不想 SSH，只想通过 CPA 管理接口远程检测/删除
+- 对应本工具模式：`--cpa-url --management-key`
+
+> 结论：
+> - 管理 **Git 仓库凭证**：优先用 `--repo-url`
+> - 管理 **远程服务器本地凭证**：用 `--cpa-url`
 
 ---
 
-## 功能
+## 功能概览
 
-- 支持三种模式：
-  1. **CPA 在线模式（推荐）**：`--cpa-url --management-key`
-  2. 本地目录模式：`--auth-dir`
-  3. 仓库模式：`--repo-url`（可配 `--git-key`）
-- 批量检测多 Provider（当前已覆盖）：
+- 支持三种输入模式：
+  1. `--repo-url`（主推：云端 Git 仓库凭证）
+  2. `--cpa-url`（远程 CPA 本地凭证）
+  3. `--auth-dir`（当前机器本地目录）
+- 批量检测 provider（当前已覆盖）：
   - `codex`
   - `antigravity`
   - `gemini`
   - `gemini-cli`
-  - 其他 provider（离线兜底）
-- 输出统计 + JSON 报告
-- 按状态一键删除
-  - CPA 在线模式：直接删 CPA 里的凭证
-  - 目录/仓库模式：删本地文件
-  - 仓库模式可选 `git commit/push`
+  - 其他 provider 提供离线兜底判定
+- 输出统计和完整 JSON 报告
+- 支持按状态一键删除
+  - repo 模式：删文件后可 `git commit` + `git push`
+  - cpa 模式：调用 CPA 管理接口直接删除
+  - auth-dir 模式：删除本地文件
 
 ---
 
-## 快速开始
+## 环境要求
 
-### 1) 云端/远程 CPA（不需要 SSH）
+- Python 3.9+
+- Git（仅 repo 模式需要）
+- 能访问目标网络（OpenAI/Google/CPA 接口）
+
+---
+
+## 从零开始：别人拿到仓库怎么用
+
+### 1) 克隆本项目
 
 ```bash
-PYTHONPATH=src python3 -m cliproxy_credman \
-  --cpa-url http://你的CPA地址:8317 \
-  --management-key 你的管理密码 \
-  --workers 18 \
-  --timeout 35 \
-  --report-file ./cpa_report.json
+git clone https://github.com/constansino/cliproxyapi-credential-batch-manager.git
+cd cliproxyapi-credential-batch-manager
 ```
 
-### 2) 云端一键删除失效/封号
+### 2) 最简单运行方式（无需安装）
+
+```bash
+PYTHONPATH=src python3 -m cliproxy_credman --help
+```
+
+### 3) 可选：安装为命令
+
+```bash
+python3 -m pip install -e .
+cliproxy-credman --help
+```
+
+---
+
+## 场景 1（主推）：管理云端 Git 仓库凭证
+
+### 1. 只检测，不删除
 
 ```bash
 PYTHONPATH=src python3 -m cliproxy_credman \
-  --cpa-url http://你的CPA地址:8317 \
-  --management-key 你的管理密码 \
+  --repo-url https://github.com/your-org/your-auth-repo.git \
+  --repo-branch master \
+  --report-file ./repo_report.json
+```
+
+如果是私有仓库，用 SSH key：
+
+```bash
+PYTHONPATH=src python3 -m cliproxy_credman \
+  --repo-url git@github.com:your-org/your-auth-repo.git \
+  --repo-branch master \
+  --git-key ~/.ssh/id_ed25519 \
+  --report-file ./repo_report.json
+```
+
+### 2. 删除失效并自动提交推送
+
+```bash
+PYTHONPATH=src python3 -m cliproxy_credman \
+  --repo-url git@github.com:your-org/your-auth-repo.git \
+  --repo-branch master \
+  --git-key ~/.ssh/id_ed25519 \
   --delete-statuses invalidated,deactivated,expired_by_time,unauthorized \
-  --report-file ./cpa_report.json
+  --git-commit \
+  --git-push \
+  --git-author-name "cred-bot" \
+  --git-author-email "cred-bot@example.com" \
+  --report-file ./repo_report.json
 ```
 
-先预览不删：
+### 3. 先预演（不删）
 
 ```bash
 PYTHONPATH=src python3 -m cliproxy_credman \
-  --cpa-url http://你的CPA地址:8317 \
-  --management-key 你的管理密码 \
+  --repo-url git@github.com:your-org/your-auth-repo.git \
+  --git-key ~/.ssh/id_ed25519 \
   --delete-statuses invalidated,deactivated \
   --dry-run \
+  --report-file ./repo_report_preview.json
+```
+
+---
+
+## 场景 2：管理远程服务器 CPA 本地凭证（不 SSH）
+
+> 注意：这个场景不是管理 Git 仓库，而是管理服务器 CPA 当前加载的本地凭证。
+
+### 1. 检测
+
+```bash
+PYTHONPATH=src python3 -m cliproxy_credman \
+  --cpa-url http://your-cpa-host:8317 \
+  --management-key YOUR_MANAGEMENT_KEY \
   --report-file ./cpa_report.json
 ```
 
-### 3) 本地目录模式
+### 2. 删除（先 dry-run）
+
+```bash
+PYTHONPATH=src python3 -m cliproxy_credman \
+  --cpa-url http://your-cpa-host:8317 \
+  --management-key YOUR_MANAGEMENT_KEY \
+  --delete-statuses invalidated,deactivated \
+  --dry-run \
+  --report-file ./cpa_report_preview.json
+```
+
+### 3. 真删
+
+```bash
+PYTHONPATH=src python3 -m cliproxy_credman \
+  --cpa-url http://your-cpa-host:8317 \
+  --management-key YOUR_MANAGEMENT_KEY \
+  --delete-statuses invalidated,deactivated \
+  --report-file ./cpa_report.json
+```
+
+---
+
+## 场景 3：本地目录模式
 
 ```bash
 PYTHONPATH=src python3 -m cliproxy_credman \
@@ -81,66 +169,60 @@ PYTHONPATH=src python3 -m cliproxy_credman \
   --report-file ./local_report.json
 ```
 
-### 4) 仓库模式
-
-```bash
-PYTHONPATH=src python3 -m cliproxy_credman \
-  --repo-url https://github.com/your-org/your-auth-repo.git \
-  --git-key ~/.ssh/id_ed25519 \
-  --repo-branch master \
-  --report-file ./repo_report.json
-```
-
-删除并推送：
-
-```bash
-PYTHONPATH=src python3 -m cliproxy_credman \
-  --repo-url git@github.com:your-org/your-auth-repo.git \
-  --git-key ~/.ssh/id_ed25519 \
-  --delete-statuses invalidated,deactivated,expired_by_time \
-  --git-commit --git-push \
-  --git-author-name "cred-bot" \
-  --git-author-email "cred-bot@example.com"
-```
-
 ---
 
-## 状态说明
+## 关键参数说明
 
-- `active`：凭证看起来可用
-- `invalidated`：token 已失效/被作废
-- `deactivated`：账号被停用/封禁
-- `expired_by_time`：离线时间判断已过期
-- `unauthorized`：401 但不属于 invalidated/deactivated
-- `missing_token`：缺少 access_token
-- `check_error`：检测过程中异常
-- `unknown`：暂无法判定
-
----
-
-## 参数
-
-- `--cpa-url`：CPA 基础地址（如 `http://127.0.0.1:8317`）
-- `--management-key`：CPA 管理密码/密钥
-- `--auth-dir`：本地凭证目录
-- `--repo-url`：凭证仓库地址
-- `--repo-branch`：分支（默认 `master`）
-- `--git-key`：Git SSH 私钥路径
-- `--auth-subdir`：仓库内凭证目录（默认 `auths`）
-- `--workers`：并发数（默认 `16`）
-- `--timeout`：请求超时秒数（默认 `35`）
+- `--repo-url`：凭证仓库地址（主推场景）
+- `--repo-branch`：分支名（默认 `master`）
+- `--git-key`：私有仓库 SSH key
+- `--cpa-url`：CPA 服务地址（例如 `http://127.0.0.1:8317`）
+- `--management-key`：CPA 管理密钥
+- `--auth-dir`：本地 auth 目录
+- `--workers`：并发数（默认 16）
+- `--timeout`：请求超时秒数（默认 35）
+- `--delete-statuses`：要删除的状态，逗号分隔
+- `--dry-run`：只预演，不删除
+- `--git-commit` / `--git-push`：repo 模式提交推送
 - `--report-file`：报告输出路径
-- `--delete-statuses`：要删除的状态列表（逗号分隔）
-- `--dry-run`：只预览不删除
-- `--git-commit` / `--git-push`：仓库模式下提交/推送
+
+---
+
+## 状态定义
+
+- `active`：凭证可用（或至少未被判定失效）
+- `invalidated`：token 已失效/被作废
+- `deactivated`：账号被停用
+- `expired_by_time`：离线时间字段/JWT 判定过期
+- `unauthorized`：401 但非 invalidated/deactivated
+- `missing_token`：缺失 token
+- `check_error`：检测过程异常
+- `unknown`：暂无法判断
+
+---
+
+## 报告格式
+
+报告为 JSON，核心字段：
+
+- `mode`: `repo` / `cpa` / `local`
+- `summary.by_status`: 各状态统计
+- `results[]`:
+  - `file`
+  - `provider`
+  - `status`
+  - `http_status`
+  - `reason`
+  - `detail`
 
 ---
 
 ## 安全建议
 
-- 工具不会输出完整 token。
-- 报告文件可能包含账号名和错误摘要，请妥善保存。
-- 使用最小权限的管理密钥与 Git 凭证。
+- 本工具不会打印完整 token。
+- 报告含账号文件名和错误摘要，请妥善保管。
+- 使用最小权限 Git key / 管理密钥。
+- 不要把报告或私钥提交到工具仓库。
 
 ---
 
