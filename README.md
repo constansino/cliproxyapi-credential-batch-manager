@@ -74,6 +74,19 @@ PYTHONPATH=src python3 -m cliproxy_credman \
 
 > 说明：`--interactive` 与 `--schedule-minutes` 不能同时使用。
 
+### 菜单交互版（推荐给非命令行用户）
+
+运行后会逐步提问：
+- 选择模式（repo/cpa/local）
+- 填写连接信息
+- 选择是否启用 TG 推送
+- 选择单次或定时
+- 选择删除策略
+
+```bash
+PYTHONPATH=src python3 -m cliproxy_credman --menu
+```
+
 ---
 
 ## Telegram 推送

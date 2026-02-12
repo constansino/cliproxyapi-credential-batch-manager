@@ -38,6 +38,7 @@ def utc_now_text() -> str:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="CLIProxyAPI credential batch manager")
+    parser.add_argument("--menu", action="store_true", help="Start interactive menu wizard")
     parser.add_argument("--cpa-url", help="CLIProxyAPI base url, e.g. http://127.0.0.1:8317")
     parser.add_argument("--management-key", help="CLIProxyAPI management password/key")
     parser.add_argument("--auth-dir", help="Local auth directory with JSON files")
@@ -658,6 +659,117 @@ def prompt_yes_no(question: str, default_no: bool = True) -> bool:
     return raw in {"y", "yes"}
 
 
+def prompt_input(question: str, default_value: str = "") -> str:
+    suffix = f" [{default_value}]" if default_value else ""
+    raw = input(f"{question}{suffix}: ").strip()
+    return raw if raw else default_value
+
+
+def prompt_choice(question: str, options: List[Tuple[str, str]], default_key: str) -> str:
+    print(f"\n{question}")
+    for key, label in options:
+        print(f"  {key}) {label}")
+    while True:
+        selected = prompt_input("请选择", default_key)
+        keys = {key for key, _ in options}
+        if selected in keys:
+            return selected
+        print("输入无效，请重试。")
+
+
+def apply_menu_configuration(args: argparse.Namespace) -> argparse.Namespace:
+    print("\n=== CPA Credential Batch Manager 菜单向导 ===")
+
+    mode = prompt_choice(
+        "选择数据来源模式",
+        [
+            ("1", "Repository Mode（云端 Git 仓库凭证）"),
+            ("2", "CPA API Mode（远程 CPA 本地凭证）"),
+            ("3", "Local Directory Mode（本机目录）"),
+        ],
+        "1",
+    )
+
+    args.cpa_url = None
+    args.management_key = None
+    args.repo_url = None
+    args.auth_dir = None
+
+    if mode == "1":
+        args.repo_url = prompt_input("输入 repo URL")
+        args.repo_branch = prompt_input("输入分支", args.repo_branch or "master")
+        args.git_key = prompt_input("输入 SSH key 路径（私有仓库建议填写）", args.git_key or "") or None
+        args.auth_subdir = prompt_input("仓库内凭证目录", args.auth_subdir or "auths")
+    elif mode == "2":
+        args.cpa_url = prompt_input("输入 CPA URL（例如 http://127.0.0.1:8317）")
+        args.management_key = prompt_input("输入 CPA management key")
+    else:
+        args.auth_dir = prompt_input("输入本地 auth 目录路径")
+
+    args.workers = int(prompt_input("并发 workers", str(args.workers)))
+    args.timeout = int(prompt_input("请求超时秒数", str(args.timeout)))
+    args.report_file = prompt_input("报告输出文件", args.report_file)
+
+    enable_tg = prompt_yes_no("是否启用 Telegram 推送？", default_no=True)
+    if enable_tg:
+        args.tg_bot_token = prompt_input("TG Bot Token")
+        args.tg_chat_id = prompt_input("TG Chat ID")
+    else:
+        args.tg_bot_token = ""
+        args.tg_chat_id = ""
+
+    schedule_choice = prompt_choice(
+        "运行方式",
+        [
+            ("1", "单次运行"),
+            ("2", "定时运行"),
+        ],
+        "1",
+    )
+    if schedule_choice == "2":
+        args.schedule_minutes = int(prompt_input("定时间隔（分钟）", "30"))
+    else:
+        args.schedule_minutes = 0
+
+    delete_mode = prompt_choice(
+        "删除策略",
+        [
+            ("1", "不删除，只检测"),
+            ("2", "检测后交互选择删除状态"),
+            ("3", "固定状态自动删除/预演"),
+        ],
+        "2",
+    )
+
+    args.delete_statuses = ""
+    args.dry_run = False
+    args.interactive = False
+
+    if delete_mode == "2":
+        if args.schedule_minutes > 0:
+            print("定时模式不支持交互删除，已切换为固定状态 dry-run。")
+            args.delete_statuses = "invalidated,deactivated,expired_by_time,unauthorized"
+            args.dry_run = True
+        else:
+            args.interactive = True
+    elif delete_mode == "3":
+        args.delete_statuses = prompt_input(
+            "输入要处理的状态（逗号分隔）",
+            "invalidated,deactivated,expired_by_time,unauthorized",
+        )
+        args.dry_run = prompt_yes_no("是否 dry-run（只预演不删除）？", default_no=False)
+
+    if mode == "1" and args.delete_statuses and not args.dry_run:
+        args.git_commit = prompt_yes_no("删除后是否 git commit？", default_no=False)
+        args.git_push = prompt_yes_no("删除后是否 git push？", default_no=False)
+        if args.git_commit:
+            args.git_author_name = prompt_input("git author name", args.git_author_name or "cred-bot")
+            args.git_author_email = prompt_input("git author email", args.git_author_email or "cred-bot@example.com")
+
+    print("\n菜单配置完成，开始执行...\n")
+    return args
+
+
 def interactive_delete_statuses(results: List[CheckResult]) -> Tuple[List[str], bool]:
     status_counts = summarize(results).get("by_status", {})
     print("\n可删除状态候选:")
@@ -797,6 +909,9 @@ def run_once(args: argparse.Namespace) -> Dict[str, Any]:
 
 def main() -> None:
     args = parse_args()
+
+    if args.menu:
+        args = apply_menu_configuration(args)
 
     if args.schedule_minutes < 0:
         raise ValueError("--schedule-minutes must be >= 0")
