@@ -13,7 +13,7 @@ git clone https://github.com/constansino/cliproxyapi-credential-batch-manager.gi
 cd cliproxyapi-credential-batch-manager
 
 PYTHONPATH=src python3 -m cliproxy_credman \
-  --repo-url https://github.com/constansino/conscliproxyapi \
+  --repo-url https://github.com/your-org/your-auth-repo \
   --git-token YOUR_GIT_TOKEN \
   --interactive \
   --report-file ./repo_report.json
@@ -23,7 +23,7 @@ PYTHONPATH=src python3 -m cliproxy_credman \
 
 ```bash
 PYTHONPATH=src python3 -m cliproxy_credman \
-  --repo-url https://github.com/constansino/conscliproxyapi \
+  --repo-url https://github.com/your-org/your-auth-repo \
   --git-token YOUR_GIT_TOKEN \
   --interactive \
   --tg-bot-token YOUR_TG_BOT_TOKEN \
@@ -35,7 +35,7 @@ PYTHONPATH=src python3 -m cliproxy_credman \
 
 ```bash
 PYTHONPATH=src python3 -m cliproxy_credman \
-  --repo-url https://github.com/constansino/conscliproxyapi \
+  --repo-url https://github.com/your-org/your-auth-repo \
   --git-token YOUR_GIT_TOKEN \
   --schedule-minutes 30 \
   --tg-bot-token YOUR_TG_BOT_TOKEN \
@@ -220,7 +220,7 @@ JSON 报告关键字段：
 ```bash
 export GIT_TOKEN='YOUR_GIT_TOKEN'
 PYTHONPATH=src python3 -m cliproxy_credman \
-  --repo-url https://github.com/constansino/conscliproxyapi \
+  --repo-url https://github.com/your-org/your-auth-repo \
   --interactive \
   --report-file ./repo_report.json
 ```
