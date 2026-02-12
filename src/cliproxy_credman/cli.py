@@ -611,6 +611,47 @@ def delete_credentials_cpa(
     return deleted
 
 
+def delete_credentials_cpa_by_names(
+    cpa_url: str,
+    management_key: str,
+    file_names: List[str],
+    timeout_seconds: int,
+) -> List[str]:
+    deleted: List[str] = []
+    for name in file_names:
+        url = f"{cpa_url.rstrip('/')}/v0/management/auth-files?{urllib.parse.urlencode({'name': name})}"
+        code, body = http_json_request(
+            url=url,
+            method="DELETE",
+            headers={"Authorization": f"Bearer {management_key}"},
+            body=None,
+            timeout_seconds=timeout_seconds,
+        )
+        if code == 200:
+            deleted.append(name)
+        else:
+            print(f"delete failed: {name}, status={code}, body={short_text(body, 200)}")
+    return deleted
+
+
+def delete_credentials_local_by_names(
+    results: List[CheckResult],
+    file_names: List[str],
+) -> List[str]:
+    mapping = {result.file: result.path for result in results}
+    deleted: List[str] = []
+    for name in file_names:
+        path_text = mapping.get(name, "")
+        if not path_text:
+            continue
+        file_path = Path(path_text)
+        if not file_path.exists():
+            continue
+        file_path.unlink(missing_ok=True)
+        deleted.append(name)
+    return deleted
+
+
 def git_commit_and_push(
     repo_dir: Path,
     git_env: Dict[str, str],
@@ -781,9 +822,6 @@ def apply_menu_configuration(args: argparse.Namespace) -> argparse.Namespace:
     if mode == "1" and args.delete_statuses and not args.dry_run:
         args.git_commit = prompt_yes_no("删除后是否 git commit？", default_no=False)
         args.git_push = prompt_yes_no("删除后是否 git push？", default_no=False)
-        if args.git_commit:
-            args.git_author_name = prompt_input("git author name", args.git_author_name or "cred-bot")
-            args.git_author_email = prompt_input("git author email", args.git_author_email or "cred-bot@example.com")
 
     print("\n菜单配置完成，开始执行...\n")
     return args
@@ -895,6 +933,110 @@ def interactive_delete_plan(results: List[CheckResult]) -> Tuple[List[str], str]
         print("输入无效，请重试。")
 
 
+def interactive_manage_and_delete(
+    args: argparse.Namespace,
+    results: List[CheckResult],
+    cpa_mode: bool,
+    repo_mode: bool,
+    repo_dir: Optional[Path],
+    git_env: Optional[Dict[str, str]],
+) -> Tuple[List[str], List[str], Dict[str, Any], bool]:
+    deleted_files: List[str] = []
+    affected_statuses: List[str] = []
+    git_result: Dict[str, Any] = {"committed": False, "pushed": False, "commit_id": ""}
+
+    while True:
+        grouped = group_results_by_status(results)
+        if not grouped:
+            print("\n没有可展示的凭证。")
+            break
+
+        ordered = print_status_overview(results, [])
+        print("\n操作：输入序号进入状态详情；q=结束")
+        command = input("请输入: ").strip().lower()
+        if command == "q":
+            break
+        if not command.isdigit():
+            print("输入无效，请输入序号或 q。")
+            continue
+        position = int(command)
+        if position < 1 or position > len(ordered):
+            print("序号超出范围。")
+            continue
+
+        status = ordered[position - 1]
+        status_items = grouped[status]
+        selected: set[int] = set()
+
+        while True:
+            print(f"\n--- {status} 凭证列表（{len(status_items)}）---")
+            for idx, item in enumerate(status_items, start=1):
+                checked = "x" if idx in selected else " "
+                code_text = str(item.http_status) if item.http_status is not None else "-"
+                print(f"{idx:>3}. [{checked}] {item.file} | http={code_text}")
+            print("\n按键：<空格+序号>切换选择，a=全选此状态，n=清空选择，x=删除并推送，b=返回")
+            raw = input("请输入: ")
+            action = raw.strip().lower()
+
+            if action == "b":
+                break
+            if action == "a":
+                selected = set(range(1, len(status_items) + 1))
+                continue
+            if action == "n":
+                selected.clear()
+                continue
+            if action == "x":
+                indices = sorted(selected) if selected else list(range(1, len(status_items) + 1))
+                target_names = [status_items[index - 1].file for index in indices]
+                print(f"将删除 {len(target_names)} 个凭证（状态={status}）")
+                if not prompt_yes_no("确认删除并执行后续动作？", default_no=True):
+                    continue
+
+                if cpa_mode:
+                    removed = delete_credentials_cpa_by_names(args.cpa_url, args.management_key, target_names, args.timeout)
+                else:
+                    removed = delete_credentials_local_by_names(results, target_names)
+
+                if removed:
+                    deleted_files.extend(removed)
+                    if status not in affected_statuses:
+                        affected_statuses.append(status)
+                    removed_set = set(removed)
+                    results[:] = [result for result in results if result.file not in removed_set]
+
+                    if repo_mode and repo_dir is not None:
+                        git_result = git_commit_and_push(
+                            repo_dir=repo_dir,
+                            git_env=git_env or dict(os.environ),
+                            do_commit=True,
+                            do_push=True,
+                            author_name=args.git_author_name,
+                            author_email=args.git_author_email,
+                            delete_statuses=[status],
+                        )
+                        if git_result.get("pushed"):
+                            print("已自动提交并推送到仓库。")
+                else:
+                    print("没有删除任何文件。")
+                break
+
+            toggle_text = raw
+            if toggle_text.strip().isdigit():
+                index = int(toggle_text.strip())
+                if 1 <= index <= len(status_items):
+                    if index in selected:
+                        selected.remove(index)
+                    else:
+                        selected.add(index)
+                else:
+                    print("序号超出范围。")
+            else:
+                print("无效输入。")
+
+    return affected_statuses, deleted_files, git_result, False
+
+
 def telegram_text(report: Dict[str, Any]) -> str:
     mode = report.get("mode", "")
     total = report.get("total", 0)
@@ -959,88 +1101,60 @@ def run_once(args: argparse.Namespace) -> Dict[str, Any]:
 
         delete_statuses = parse_delete_statuses(args.delete_statuses)
         run_dry_run = bool(args.dry_run)
-        interactive_mode = "none"
-        if args.interactive:
-            chosen_statuses, mode = interactive_delete_plan(results)
-            delete_statuses = chosen_statuses
-            interactive_mode = mode
-            if mode == "dry":
-                run_dry_run = True
-            elif mode == "apply":
-                run_dry_run = False
-            elif mode == "dry_then_apply":
-                run_dry_run = False
-            else:
-                run_dry_run = True
-
         deleted_files: List[str] = []
         git_result: Dict[str, Any] = {"committed": False, "pushed": False, "commit_id": ""}
 
-        if delete_statuses:
+        if args.interactive:
+            delete_statuses, deleted_files, git_result, run_dry_run = interactive_manage_and_delete(
+                args=args,
+                results=results,
+                cpa_mode=cpa_mode,
+                repo_mode=repo_mode,
+                repo_dir=repo_dir,
+                git_env=git_env,
+            )
+        elif delete_statuses:
             preview_targets = sorted([item.file for item in results if item.status in delete_statuses])
-            if interactive_mode in {"dry", "dry_then_apply"}:
+            if run_dry_run:
                 print(f"\ndry-run 预演将影响 {len(preview_targets)} 个凭证")
                 for name in preview_targets[:20]:
                     print(f"- {name}")
                 if len(preview_targets) > 20:
                     print("...")
-
-            if args.interactive and not prompt_yes_no("确认执行当前删除动作？", default_no=True):
-                print("已取消删除。")
-            else:
-                if interactive_mode == "dry_then_apply":
-                    _ = delete_credentials_cpa(
+                if cpa_mode:
+                    deleted_files = delete_credentials_cpa(
                         cpa_url=args.cpa_url,
                         management_key=args.management_key,
                         results=results,
                         delete_statuses=delete_statuses,
                         dry_run=True,
                         timeout_seconds=args.timeout,
-                    ) if cpa_mode else delete_credentials(results, delete_statuses, dry_run=True)
-                    if not prompt_yes_no("dry-run 完成，是否执行真删？", default_no=True):
-                        print("已跳过真删。")
-                    else:
-                        if cpa_mode:
-                            deleted_files = delete_credentials_cpa(
-                                cpa_url=args.cpa_url,
-                                management_key=args.management_key,
-                                results=results,
-                                delete_statuses=delete_statuses,
-                                dry_run=False,
-                                timeout_seconds=args.timeout,
-                            )
-                        else:
-                            deleted_files = delete_credentials(results, delete_statuses, dry_run=False)
-                        run_dry_run = False
-                else:
-                    if cpa_mode:
-                        deleted_files = delete_credentials_cpa(
-                            cpa_url=args.cpa_url,
-                            management_key=args.management_key,
-                            results=results,
-                            delete_statuses=delete_statuses,
-                            dry_run=run_dry_run,
-                            timeout_seconds=args.timeout,
-                        )
-                    else:
-                        deleted_files = delete_credentials(results, delete_statuses, dry_run=run_dry_run)
-
-                if repo_mode and not run_dry_run and deleted_files:
-                    if args.interactive:
-                        args.git_commit = prompt_yes_no("repo 已删除，是否 git commit？", default_no=False)
-                        args.git_push = args.git_commit and prompt_yes_no("是否 git push？", default_no=False)
-                        if args.git_commit:
-                            args.git_author_name = prompt_input("git author name", args.git_author_name or "cred-bot")
-                            args.git_author_email = prompt_input("git author email", args.git_author_email or "cred-bot@example.com")
-                    git_result = git_commit_and_push(
-                        repo_dir=repo_dir,
-                        git_env=git_env or dict(os.environ),
-                        do_commit=args.git_commit,
-                        do_push=args.git_push,
-                        author_name=args.git_author_name,
-                        author_email=args.git_author_email,
-                        delete_statuses=delete_statuses,
                     )
+                else:
+                    deleted_files = delete_credentials(results, delete_statuses, dry_run=True)
+            else:
+                if cpa_mode:
+                    deleted_files = delete_credentials_cpa(
+                        cpa_url=args.cpa_url,
+                        management_key=args.management_key,
+                        results=results,
+                        delete_statuses=delete_statuses,
+                        dry_run=False,
+                        timeout_seconds=args.timeout,
+                    )
+                else:
+                    deleted_files = delete_credentials(results, delete_statuses, dry_run=False)
+
+            if repo_mode and not run_dry_run and deleted_files:
+                git_result = git_commit_and_push(
+                    repo_dir=repo_dir,
+                    git_env=git_env or dict(os.environ),
+                    do_commit=args.git_commit,
+                    do_push=args.git_push,
+                    author_name=args.git_author_name,
+                    author_email=args.git_author_email,
+                    delete_statuses=delete_statuses,
+                )
 
         report = {
             "checked_at_utc": utc_now_text(),
