@@ -807,6 +807,94 @@ def interactive_delete_statuses(results: List[CheckResult]) -> Tuple[List[str], 
     return statuses, dry_run
 
 
+def group_results_by_status(results: List[CheckResult]) -> Dict[str, List[CheckResult]]:
+    grouped: Dict[str, List[CheckResult]] = {}
+    for result in results:
+        grouped.setdefault(result.status, []).append(result)
+    for status in grouped:
+        grouped[status] = sorted(grouped[status], key=lambda item: item.file)
+    return grouped
+
+
+def print_status_overview(results: List[CheckResult], selected_statuses: List[str]) -> List[str]:
+    grouped = group_results_by_status(results)
+    ordered = sorted(grouped.keys(), key=lambda key: (-len(grouped[key]), key))
+    selected = set(selected_statuses)
+
+    print("\n=== 状态总览（每类最多展示 10 条）===")
+    for index, status in enumerate(ordered, start=1):
+        items = grouped[status]
+        marker = "*" if status in selected else " "
+        print(f"{index:>2}. [{marker}] {status} ({len(items)})")
+        sample = items[:10]
+        for item in sample:
+            print(f"    - {item.file}")
+        if len(items) > 10:
+            print("    ...")
+    return ordered
+
+
+def interactive_status_picker(results: List[CheckResult]) -> List[str]:
+    grouped = group_results_by_status(results)
+    selected: List[str] = []
+
+    while True:
+        ordered = print_status_overview(results, selected)
+        print("\n操作：输入序号查看详情；x=执行删除流程；q=不删除并退出")
+        command = input("请输入: ").strip().lower()
+        if command == "q":
+            return []
+        if command == "x":
+            return selected
+        if not command.isdigit():
+            print("输入无效，请输入序号/x/q。")
+            continue
+
+        position = int(command)
+        if position < 1 or position > len(ordered):
+            print("序号超出范围。")
+            continue
+
+        status = ordered[position - 1]
+        items = grouped[status]
+        print(f"\n--- 详情：{status} ({len(items)}) ---")
+        for item in items:
+            code_text = str(item.http_status) if item.http_status is not None else "-"
+            print(f"- {item.file} | http={code_text} | {item.reason}")
+        print("\n按键：d=切换选择删除该状态，b=返回")
+        detail_action = input("请输入: ").strip().lower()
+        if detail_action == "d":
+            if status in selected:
+                selected = [value for value in selected if value != status]
+                print(f"已取消：{status}")
+            else:
+                selected.append(status)
+                print(f"已加入删除：{status}")
+
+
+def interactive_delete_plan(results: List[CheckResult]) -> Tuple[List[str], str]:
+    statuses = interactive_status_picker(results)
+    if not statuses:
+        return [], "none"
+
+    print("\n删除执行方式：")
+    print("  1) 仅 dry-run 预演")
+    print("  2) 直接真删")
+    print("  3) 先 dry-run，再确认真删")
+    print("  4) 取消")
+    while True:
+        command = input("请选择 [1/2/3/4]: ").strip()
+        if command == "1":
+            return statuses, "dry"
+        if command == "2":
+            return statuses, "apply"
+        if command == "3":
+            return statuses, "dry_then_apply"
+        if command == "4":
+            return [], "none"
+        print("输入无效，请重试。")
+
+
 def telegram_text(report: Dict[str, Any]) -> str:
     mode = report.get("mode", "")
     total = report.get("total", 0)
@@ -871,31 +959,79 @@ def run_once(args: argparse.Namespace) -> Dict[str, Any]:
 
         delete_statuses = parse_delete_statuses(args.delete_statuses)
         run_dry_run = bool(args.dry_run)
+        interactive_mode = "none"
         if args.interactive:
-            chosen_statuses, chosen_dry_run = interactive_delete_statuses(results)
+            chosen_statuses, mode = interactive_delete_plan(results)
             delete_statuses = chosen_statuses
-            run_dry_run = chosen_dry_run
+            interactive_mode = mode
+            if mode == "dry":
+                run_dry_run = True
+            elif mode == "apply":
+                run_dry_run = False
+            elif mode == "dry_then_apply":
+                run_dry_run = False
+            else:
+                run_dry_run = True
 
         deleted_files: List[str] = []
         git_result: Dict[str, Any] = {"committed": False, "pushed": False, "commit_id": ""}
 
         if delete_statuses:
-            if args.interactive and not prompt_yes_no("确认执行删除？", default_no=True):
+            preview_targets = sorted([item.file for item in results if item.status in delete_statuses])
+            if interactive_mode in {"dry", "dry_then_apply"}:
+                print(f"\ndry-run 预演将影响 {len(preview_targets)} 个凭证")
+                for name in preview_targets[:20]:
+                    print(f"- {name}")
+                if len(preview_targets) > 20:
+                    print("...")
+
+            if args.interactive and not prompt_yes_no("确认执行当前删除动作？", default_no=True):
                 print("已取消删除。")
             else:
-                if cpa_mode:
-                    deleted_files = delete_credentials_cpa(
+                if interactive_mode == "dry_then_apply":
+                    _ = delete_credentials_cpa(
                         cpa_url=args.cpa_url,
                         management_key=args.management_key,
                         results=results,
                         delete_statuses=delete_statuses,
-                        dry_run=run_dry_run,
+                        dry_run=True,
                         timeout_seconds=args.timeout,
-                    )
+                    ) if cpa_mode else delete_credentials(results, delete_statuses, dry_run=True)
+                    if not prompt_yes_no("dry-run 完成，是否执行真删？", default_no=True):
+                        print("已跳过真删。")
+                    else:
+                        if cpa_mode:
+                            deleted_files = delete_credentials_cpa(
+                                cpa_url=args.cpa_url,
+                                management_key=args.management_key,
+                                results=results,
+                                delete_statuses=delete_statuses,
+                                dry_run=False,
+                                timeout_seconds=args.timeout,
+                            )
+                        else:
+                            deleted_files = delete_credentials(results, delete_statuses, dry_run=False)
+                        run_dry_run = False
                 else:
-                    deleted_files = delete_credentials(results, delete_statuses, dry_run=run_dry_run)
+                    if cpa_mode:
+                        deleted_files = delete_credentials_cpa(
+                            cpa_url=args.cpa_url,
+                            management_key=args.management_key,
+                            results=results,
+                            delete_statuses=delete_statuses,
+                            dry_run=run_dry_run,
+                            timeout_seconds=args.timeout,
+                        )
+                    else:
+                        deleted_files = delete_credentials(results, delete_statuses, dry_run=run_dry_run)
 
                 if repo_mode and not run_dry_run and deleted_files:
+                    if args.interactive:
+                        args.git_commit = prompt_yes_no("repo 已删除，是否 git commit？", default_no=False)
+                        args.git_push = args.git_commit and prompt_yes_no("是否 git push？", default_no=False)
+                        if args.git_commit:
+                            args.git_author_name = prompt_input("git author name", args.git_author_name or "cred-bot")
+                            args.git_author_email = prompt_input("git author email", args.git_author_email or "cred-bot@example.com")
                     git_result = git_commit_and_push(
                         repo_dir=repo_dir,
                         git_env=git_env or dict(os.environ),

@@ -50,6 +50,23 @@ PYTHONPATH=src python3 -m cliproxy_credman \
 
 ---
 
+
+## `--interactive` 实际交互行为
+
+运行后会进入以下流程：
+
+1. 先显示状态总览（`active / invalidated / deactivated / expired_by_time ...`）
+2. 每个状态默认最多展示 10 条文件名，超过显示 `...`
+3. 你可以输入序号进入该状态详情页，查看该状态完整凭证名单
+4. 在详情页按 `d` 可将该状态加入/移出“待删除状态”
+5. 回到总览后按 `x` 进入删除执行方式（dry-run / 真删 / 先预演后真删）
+
+说明：
+- dry-run 时不会真的删除，但会把“将删除的名单”写入报告的 `deleted_files` 作为预演结果。
+- repo 模式真删后，交互流程会继续询问是否 `git commit` 和 `git push`。
+
+---
+
 ## 菜单交互版（最省心）
 
 不想记参数，直接走菜单：
