@@ -38,6 +38,8 @@ def utc_now_text() -> str:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="CLIProxyAPI credential batch manager")
+    parser.add_argument("--cpa-url", help="CLIProxyAPI base url, e.g. http://127.0.0.1:8317")
+    parser.add_argument("--management-key", help="CLIProxyAPI management password/key")
     parser.add_argument("--auth-dir", help="Local auth directory with JSON files")
     parser.add_argument("--repo-url", help="Git repository URL containing auth files")
     parser.add_argument("--repo-branch", default="master", help="Git branch to use")
@@ -186,6 +188,51 @@ def http_json_request(url: str, method: str, headers: Dict[str, str], body: Opti
         return err.code, text
 
 
+def cpa_headers(management_key: str) -> Dict[str, str]:
+    return {
+        "Authorization": f"Bearer {management_key}",
+        "Content-Type": "application/json",
+    }
+
+
+def cpa_fetch_auth_files(cpa_url: str, management_key: str, timeout_seconds: int) -> List[Dict[str, Any]]:
+    base_url = cpa_url.rstrip("/")
+    status_code, response_text = http_json_request(
+        url=f"{base_url}/v0/management/auth-files",
+        method="GET",
+        headers={"Authorization": f"Bearer {management_key}"},
+        body=None,
+        timeout_seconds=timeout_seconds,
+    )
+    if status_code != 200:
+        raise ValueError(f"failed to fetch auth-files: status={status_code}, body={short_text(response_text, 600)}")
+    payload = json.loads(response_text)
+    files = payload.get("files")
+    if not isinstance(files, list):
+        raise ValueError("invalid /auth-files response: missing files[]")
+    return files
+
+
+def cpa_api_call(cpa_url: str, management_key: str, payload: Dict[str, Any], timeout_seconds: int) -> Tuple[int, str]:
+    base_url = cpa_url.rstrip("/")
+    status_code, response_text = http_json_request(
+        url=f"{base_url}/v0/management/api-call",
+        method="POST",
+        headers=cpa_headers(management_key),
+        body=json.dumps(payload).encode("utf-8"),
+        timeout_seconds=timeout_seconds,
+    )
+    if status_code != 200:
+        return status_code, response_text
+    try:
+        envelope = json.loads(response_text)
+        upstream_code = int(envelope.get("status_code", 0))
+        upstream_body = str(envelope.get("body") or "")
+        return upstream_code, upstream_body
+    except Exception:
+        return 0, response_text
+
+
 def check_codex(metadata: Dict[str, Any], timeout_seconds: int) -> Tuple[str, int, str, str]:
     token = str(metadata.get("access_token") or "").strip()
     if not token:
@@ -251,6 +298,116 @@ def check_google_oauth(metadata: Dict[str, Any], timeout_seconds: int) -> Tuple[
     if status_code == 401:
         return "unauthorized", status_code, "google token unauthorized", response_text
     return "unknown", status_code, "google tokeninfo unexpected response", response_text
+
+
+def classify_codex_response(status_code: int, response_text: str) -> Tuple[str, str]:
+    lower_text = response_text.lower()
+    if status_code == 401 and ("token_invalidated" in lower_text or "authentication token has been invalidated" in lower_text):
+        return "invalidated", "codex token invalidated"
+    if status_code == 401 and ("deactivated" in lower_text or "account has been deactivated" in lower_text):
+        return "deactivated", "codex account deactivated"
+    if status_code == 401:
+        return "unauthorized", "codex unauthorized"
+    if status_code in (200, 201, 400, 402, 403, 404, 409, 422, 429):
+        return "active", "codex token appears usable"
+    return "unknown", "codex unexpected response"
+
+
+def classify_google_response(status_code: int, response_text: str) -> Tuple[str, str]:
+    lower_text = response_text.lower()
+    if status_code == 200:
+        return "active", "google oauth token appears usable"
+    if status_code == 401 and ("invalid" in lower_text or "unauthorized" in lower_text):
+        return "invalidated", "google oauth token invalid"
+    if status_code == 403:
+        return "active", "google oauth token active but scope may be limited"
+    if status_code == 401:
+        return "unauthorized", "google oauth unauthorized"
+    return "unknown", "google oauth unexpected response"
+
+
+def cpa_check_entry(cpa_url: str, management_key: str, entry: Dict[str, Any], timeout_seconds: int) -> CheckResult:
+    begin = time.time()
+    checked_at = utc_now_text()
+
+    name = str(entry.get("name") or entry.get("id") or "")
+    provider = str(entry.get("provider") or entry.get("type") or "unknown").strip().lower() or "unknown"
+    email = str(entry.get("email") or "")
+    auth_index = str(entry.get("auth_index") or "")
+
+    if not auth_index:
+        elapsed = int((time.time() - begin) * 1000)
+        return CheckResult(
+            file=name,
+            path="",
+            provider=provider,
+            email=email,
+            status="unknown",
+            http_status=None,
+            reason="missing auth_index from CPA auth-files",
+            detail="",
+            expired_field="",
+            access_token_exp_utc="",
+            checked_at_utc=checked_at,
+            elapsed_ms=elapsed,
+        )
+
+    try:
+        if provider == "codex":
+            payload = {
+                "auth_index": auth_index,
+                "method": "POST",
+                "url": "https://chatgpt.com/backend-api/codex/responses",
+                "header": {
+                    "Authorization": "Bearer $TOKEN$",
+                    "Content-Type": "application/json",
+                    "Openai-Beta": "responses=experimental",
+                    "Version": "0.98.0",
+                    "Originator": "codex_cli_rs",
+                    "User-Agent": "codex_cli_rs/0.98.0",
+                },
+                "data": json.dumps({"model": "gpt-4.1-mini", "input": "ping", "stream": False}),
+            }
+            code, body = cpa_api_call(cpa_url, management_key, payload, timeout_seconds)
+            status, reason = classify_codex_response(code, body)
+        elif provider in {"antigravity", "gemini", "gemini-cli"}:
+            payload = {
+                "auth_index": auth_index,
+                "method": "GET",
+                "url": "https://www.googleapis.com/oauth2/v3/userinfo",
+                "header": {
+                    "Authorization": "Bearer $TOKEN$",
+                    "User-Agent": "cliproxy-credman/0.1",
+                },
+            }
+            code, body = cpa_api_call(cpa_url, management_key, payload, timeout_seconds)
+            status, reason = classify_google_response(code, body)
+        else:
+            code = None
+            body = ""
+            status = "unknown"
+            reason = "unsupported provider in CPA online mode"
+    except Exception as error:
+        code = None
+        body = repr(error)
+        status = "check_error"
+        reason = "cpa api-call failed"
+
+    elapsed = int((time.time() - begin) * 1000)
+    return CheckResult(
+        file=name,
+        path="",
+        provider=provider,
+        email=email,
+        status=status,
+        http_status=code,
+        reason=reason,
+        detail=short_text(body),
+        expired_field="",
+        access_token_exp_utc="",
+        checked_at_utc=checked_at,
+        elapsed_ms=elapsed,
+    )
 
 
 def short_text(text: str, limit: int = 260) -> str:
@@ -352,6 +509,20 @@ def run_checks(auth_files: List[Path], workers: int, timeout_seconds: int) -> Li
     return sorted(results, key=lambda item: item.file)
 
 
+def run_checks_cpa(cpa_url: str, management_key: str, entries: List[Dict[str, Any]], workers: int, timeout_seconds: int) -> List[CheckResult]:
+    results: List[CheckResult] = []
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
+        futures = [
+            executor.submit(cpa_check_entry, cpa_url, management_key, entry, timeout_seconds)
+            for entry in entries
+        ]
+        for index, future in enumerate(as_completed(futures), start=1):
+            results.append(future.result())
+            if index % 50 == 0:
+                print(f"progress: {index}/{len(entries)}")
+    return sorted(results, key=lambda item: item.file)
+
+
 def summarize(results: List[CheckResult]) -> Dict[str, Any]:
     by_status: Dict[str, int] = {}
     by_provider: Dict[str, int] = {}
@@ -387,6 +558,33 @@ def delete_credentials(results: List[CheckResult], delete_statuses: List[str], d
         deleted.append(path_text)
         if not dry_run:
             file_path.unlink(missing_ok=True)
+    return deleted
+
+
+def delete_credentials_cpa(
+    cpa_url: str,
+    management_key: str,
+    results: List[CheckResult],
+    delete_statuses: List[str],
+    dry_run: bool,
+    timeout_seconds: int,
+) -> List[str]:
+    targets = [result.file for result in results if result.status in delete_statuses and result.file]
+    deleted: List[str] = []
+    for name in targets:
+        deleted.append(name)
+        if dry_run:
+            continue
+        url = f"{cpa_url.rstrip('/')}/v0/management/auth-files?{urllib.parse.urlencode({'name': name})}"
+        code, body = http_json_request(
+            url=url,
+            method="DELETE",
+            headers={"Authorization": f"Bearer {management_key}"},
+            body=None,
+            timeout_seconds=timeout_seconds,
+        )
+        if code != 200:
+            print(f"delete failed: {name}, status={code}, body={short_text(body, 200)}")
     return deleted
 
 
@@ -435,7 +633,11 @@ def git_commit_and_push(
 def print_summary(report: Dict[str, Any]) -> None:
     print("\n=== Summary ===")
     print(f"checked_at: {report['checked_at_utc']}")
-    print(f"auth_dir: {report['auth_dir']}")
+    print(f"mode: {report.get('mode', '')}")
+    if report.get("mode") == "cpa":
+        print(f"cpa_url: {report.get('cpa_url', '')}")
+    else:
+        print(f"auth_dir: {report['auth_dir']}")
     print(f"total: {report['total']}")
     print("status counts:")
     for status, count in report["summary"]["by_status"].items():
@@ -455,22 +657,45 @@ def main() -> None:
     git_env: Optional[Dict[str, str]] = None
 
     try:
-        auth_dir, temporary_workdir, repo_dir, git_env = prepare_auth_dir(args)
-        repo_mode = repo_dir is not None
+        cpa_mode = bool(args.cpa_url)
+        if cpa_mode:
+            if not args.management_key:
+                raise ValueError("--management-key is required when --cpa-url is provided")
+            entries = cpa_fetch_auth_files(args.cpa_url, args.management_key, args.timeout)
+            if not entries:
+                raise ValueError("no credentials returned by CPA /v0/management/auth-files")
+            print(f"checking {len(entries)} credentials from CPA: {args.cpa_url}")
+            results = run_checks_cpa(args.cpa_url, args.management_key, entries, workers=args.workers, timeout_seconds=args.timeout)
+            auth_dir = Path("")
+            repo_mode = False
+        else:
+            auth_dir, temporary_workdir, repo_dir, git_env = prepare_auth_dir(args)
+            repo_mode = repo_dir is not None
 
-        auth_files = collect_auth_files(auth_dir)
-        if not auth_files:
-            raise ValueError(f"no json files found under {auth_dir}")
+            auth_files = collect_auth_files(auth_dir)
+            if not auth_files:
+                raise ValueError(f"no json files found under {auth_dir}")
 
-        print(f"checking {len(auth_files)} credentials from: {auth_dir}")
-        results = run_checks(auth_files, workers=args.workers, timeout_seconds=args.timeout)
+            print(f"checking {len(auth_files)} credentials from: {auth_dir}")
+            results = run_checks(auth_files, workers=args.workers, timeout_seconds=args.timeout)
 
         delete_statuses = parse_delete_statuses(args.delete_statuses)
         deleted_files: List[str] = []
         git_result: Dict[str, Any] = {"committed": False, "pushed": False, "commit_id": ""}
 
         if delete_statuses:
-            deleted_files = delete_credentials(results, delete_statuses, dry_run=args.dry_run)
+            if cpa_mode:
+                deleted_files = delete_credentials_cpa(
+                    cpa_url=args.cpa_url,
+                    management_key=args.management_key,
+                    results=results,
+                    delete_statuses=delete_statuses,
+                    dry_run=args.dry_run,
+                    timeout_seconds=args.timeout,
+                )
+            else:
+                deleted_files = delete_credentials(results, delete_statuses, dry_run=args.dry_run)
+
             if repo_mode and not args.dry_run and deleted_files:
                 git_result = git_commit_and_push(
                     repo_dir=repo_dir,
@@ -485,8 +710,9 @@ def main() -> None:
         report = {
             "checked_at_utc": utc_now_text(),
             "duration_seconds": round(time.time() - started_at, 3),
-            "mode": "repo" if repo_mode else "local",
-            "auth_dir": str(auth_dir),
+            "mode": "cpa" if cpa_mode else ("repo" if repo_mode else "local"),
+            "cpa_url": args.cpa_url or "",
+            "auth_dir": str(auth_dir) if not cpa_mode else "",
             "total": len(results),
             "summary": summarize(results),
             "delete_statuses": delete_statuses,
@@ -510,4 +736,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
