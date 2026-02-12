@@ -55,6 +55,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--git-push", action="store_true", help="Push deletion changes in repo mode")
     parser.add_argument("--git-author-name", default="", help="Git commit author name")
     parser.add_argument("--git-author-email", default="", help="Git commit author email")
+    parser.add_argument("--interactive", action="store_true", help="Interactive mode: choose deletion after scan")
+    parser.add_argument("--schedule-minutes", type=int, default=0, help="Run scan periodically every N minutes")
+    parser.add_argument("--tg-bot-token", default="", help="Telegram bot token for notifications")
+    parser.add_argument("--tg-chat-id", default="", help="Telegram chat id for notifications")
     return parser.parse_args()
 
 
@@ -646,9 +650,66 @@ def print_summary(report: Dict[str, Any]) -> None:
         print(f"deleted: {len(report['deleted_files'])}")
 
 
-def main() -> None:
-    args = parse_args()
+def prompt_yes_no(question: str, default_no: bool = True) -> bool:
+    suffix = "[y/N]" if default_no else "[Y/n]"
+    raw = input(f"{question} {suffix}: ").strip().lower()
+    if not raw:
+        return not default_no
+    return raw in {"y", "yes"}
 
+
+def interactive_delete_statuses(results: List[CheckResult]) -> Tuple[List[str], bool]:
+    status_counts = summarize(results).get("by_status", {})
+    print("\n可删除状态候选:")
+    for status, count in status_counts.items():
+        print(f"  - {status}: {count}")
+
+    suggested = [status for status in ["invalidated", "deactivated", "expired_by_time", "unauthorized"] if status_counts.get(status, 0) > 0]
+    default_text = ",".join(suggested)
+    raw = input(f"\n输入要删除的状态（逗号分隔，直接回车=不删除）[{default_text}]: ").strip()
+    selected_text = raw or default_text
+    statuses = parse_delete_statuses(selected_text)
+    if not statuses:
+        return [], True
+
+    dry_run = prompt_yes_no("先 dry-run 预演删除吗？", default_no=False)
+    return statuses, dry_run
+
+
+def telegram_text(report: Dict[str, Any]) -> str:
+    mode = report.get("mode", "")
+    total = report.get("total", 0)
+    summary = report.get("summary", {}).get("by_status", {})
+    lines = [
+        "[CPA Credential Batch Manager]",
+        f"Time: {report.get('checked_at_utc', '')}",
+        f"Mode: {mode}",
+        f"Total: {total}",
+        "Status:",
+    ]
+    for key, value in summary.items():
+        lines.append(f"- {key}: {value}")
+    deleted_count = len(report.get("deleted_files", []))
+    if deleted_count:
+        lines.append(f"Deleted: {deleted_count}")
+    return "\n".join(lines)
+
+
+def send_telegram(bot_token: str, chat_id: str, text: str, timeout_seconds: int) -> None:
+    payload = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode("utf-8")
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    code, body = http_json_request(
+        url=url,
+        method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        body=payload,
+        timeout_seconds=timeout_seconds,
+    )
+    if code != 200:
+        print(f"telegram push failed: status={code}, body={short_text(body, 200)}")
+
+
+def run_once(args: argparse.Namespace) -> Dict[str, Any]:
     started_at = time.time()
     auth_dir: Path
     repo_mode = False
@@ -671,41 +732,48 @@ def main() -> None:
         else:
             auth_dir, temporary_workdir, repo_dir, git_env = prepare_auth_dir(args)
             repo_mode = repo_dir is not None
-
             auth_files = collect_auth_files(auth_dir)
             if not auth_files:
                 raise ValueError(f"no json files found under {auth_dir}")
-
             print(f"checking {len(auth_files)} credentials from: {auth_dir}")
             results = run_checks(auth_files, workers=args.workers, timeout_seconds=args.timeout)
 
         delete_statuses = parse_delete_statuses(args.delete_statuses)
+        run_dry_run = bool(args.dry_run)
+        if args.interactive:
+            chosen_statuses, chosen_dry_run = interactive_delete_statuses(results)
+            delete_statuses = chosen_statuses
+            run_dry_run = chosen_dry_run
+
         deleted_files: List[str] = []
         git_result: Dict[str, Any] = {"committed": False, "pushed": False, "commit_id": ""}
 
         if delete_statuses:
-            if cpa_mode:
-                deleted_files = delete_credentials_cpa(
-                    cpa_url=args.cpa_url,
-                    management_key=args.management_key,
-                    results=results,
-                    delete_statuses=delete_statuses,
-                    dry_run=args.dry_run,
-                    timeout_seconds=args.timeout,
-                )
+            if args.interactive and not prompt_yes_no("确认执行删除？", default_no=True):
+                print("已取消删除。")
             else:
-                deleted_files = delete_credentials(results, delete_statuses, dry_run=args.dry_run)
+                if cpa_mode:
+                    deleted_files = delete_credentials_cpa(
+                        cpa_url=args.cpa_url,
+                        management_key=args.management_key,
+                        results=results,
+                        delete_statuses=delete_statuses,
+                        dry_run=run_dry_run,
+                        timeout_seconds=args.timeout,
+                    )
+                else:
+                    deleted_files = delete_credentials(results, delete_statuses, dry_run=run_dry_run)
 
-            if repo_mode and not args.dry_run and deleted_files:
-                git_result = git_commit_and_push(
-                    repo_dir=repo_dir,
-                    git_env=git_env or dict(os.environ),
-                    do_commit=args.git_commit,
-                    do_push=args.git_push,
-                    author_name=args.git_author_name,
-                    author_email=args.git_author_email,
-                    delete_statuses=delete_statuses,
-                )
+                if repo_mode and not run_dry_run and deleted_files:
+                    git_result = git_commit_and_push(
+                        repo_dir=repo_dir,
+                        git_env=git_env or dict(os.environ),
+                        do_commit=args.git_commit,
+                        do_push=args.git_push,
+                        author_name=args.git_author_name,
+                        author_email=args.git_author_email,
+                        delete_statuses=delete_statuses,
+                    )
 
         report = {
             "checked_at_utc": utc_now_text(),
@@ -716,22 +784,48 @@ def main() -> None:
             "total": len(results),
             "summary": summarize(results),
             "delete_statuses": delete_statuses,
-            "dry_run": bool(args.dry_run),
+            "dry_run": run_dry_run,
             "deleted_files": deleted_files,
             "git": git_result,
             "results": [asdict(result) for result in results],
         }
-
-        output_path = Path(args.report_file).expanduser().resolve()
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-
-        print_summary(report)
-        print(f"report_file: {output_path}")
-
+        return report
     finally:
         if temporary_workdir and repo_dir is not None:
             shutil.rmtree(repo_dir.parent, ignore_errors=True)
+
+
+def main() -> None:
+    args = parse_args()
+
+    if args.schedule_minutes < 0:
+        raise ValueError("--schedule-minutes must be >= 0")
+    if args.schedule_minutes > 0 and args.interactive:
+        raise ValueError("--interactive cannot be used with --schedule-minutes")
+
+    report_path = Path(args.report_file).expanduser().resolve()
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+
+    iteration = 0
+    while True:
+        iteration += 1
+        if iteration > 1:
+            sleep_seconds = args.schedule_minutes * 60
+            print(f"\nnext run in {args.schedule_minutes} minute(s)...")
+            time.sleep(sleep_seconds)
+
+        report = run_once(args)
+        report["iteration"] = iteration
+        report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        print_summary(report)
+        print(f"report_file: {report_path}")
+
+        if args.tg_bot_token and args.tg_chat_id:
+            send_telegram(args.tg_bot_token, args.tg_chat_id, telegram_text(report), args.timeout)
+
+        if args.schedule_minutes <= 0:
+            break
 
 
 if __name__ == "__main__":
