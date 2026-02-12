@@ -51,6 +51,39 @@ cliproxy-credman --help
 
 ### A. Repository Mode（推荐）
 
+
+### A-1. 私有仓库访问（SSH Key）
+
+如果凭证仓库是私有仓库，建议使用 SSH key。
+
+#### 1) 准备 key 文件（示例）
+
+- macOS/Linux 常见路径：`~/.ssh/id_ed25519`
+- 确保权限正确：
+
+```bash
+chmod 600 ~/.ssh/id_ed25519
+```
+
+#### 2) 验证 key 是否可访问仓库
+
+```bash
+ssh -T git@github.com
+```
+
+如首次连接出现 host 指纹确认，输入 `yes`。
+
+#### 3) 在工具中指定 key
+
+```bash
+PYTHONPATH=src python3 -m cliproxy_credman   --repo-url git@github.com:your-org/your-auth-repo.git   --repo-branch master   --git-key ~/.ssh/id_ed25519   --report-file ./repo_report.json
+```
+
+> 说明：
+> - `--git-key` 会注入 `GIT_SSH_COMMAND`，工具在 `clone/push` 时使用该 key。
+> - 如果你使用的是 GitHub Deploy Key，也可直接用同样方式。
+
+
 #### 仅检测
 
 ```bash
