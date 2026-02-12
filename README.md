@@ -2,21 +2,89 @@
 
 用于批量检测与清理 CLIProxyAPI 凭证（`auths/*.json`）的开源命令行工具。
 
-## 主要能力
+---
 
-- 批量检测凭证状态（多 provider）
-- 检测后交互式选择要删除的凭证状态
-- 可选 Telegram 推送摘要
-- 可定时巡检（分钟级）
+## 先直接用（推荐）
+
+### 1) 克隆后立刻交互运行（云端 Git 凭证仓库）
+
+```bash
+git clone https://github.com/constansino/cliproxyapi-credential-batch-manager.git
+cd cliproxyapi-credential-batch-manager
+
+PYTHONPATH=src python3 -m cliproxy_credman \
+  --repo-url https://github.com/constansino/conscliproxyapi \
+  --git-token YOUR_GIT_TOKEN \
+  --interactive \
+  --report-file ./repo_report.json
+```
+
+### 2) 在上面基础上加 Telegram 推送
+
+```bash
+PYTHONPATH=src python3 -m cliproxy_credman \
+  --repo-url https://github.com/constansino/conscliproxyapi \
+  --git-token YOUR_GIT_TOKEN \
+  --interactive \
+  --tg-bot-token YOUR_TG_BOT_TOKEN \
+  --tg-chat-id YOUR_TG_CHAT_ID \
+  --report-file ./repo_report.json
+```
+
+### 3) 在上面基础上改成定时巡检（每 30 分钟）
+
+```bash
+PYTHONPATH=src python3 -m cliproxy_credman \
+  --repo-url https://github.com/constansino/conscliproxyapi \
+  --git-token YOUR_GIT_TOKEN \
+  --schedule-minutes 30 \
+  --tg-bot-token YOUR_TG_BOT_TOKEN \
+  --tg-chat-id YOUR_TG_CHAT_ID \
+  --report-file ./repo_report.json
+```
+
+> 说明：
+> - `--interactive` 适合人工值守。
+> - `--schedule-minutes` 适合自动巡检。
+> - 两者不能同时使用。
 
 ---
 
-## 模式
+## 菜单交互版（最省心）
+
+不想记参数，直接走菜单：
+
+```bash
+PYTHONPATH=src python3 -m cliproxy_credman --menu
+```
+
+菜单会逐步让你选择：
+- repo / cpa / local 模式
+- 是否启用 TG
+- 单次运行还是定时运行
+- 删除策略（不删 / 交互删 / 固定状态删）
+
+---
+
+## 核心能力
+
+- 批量检测凭证状态（多 provider）
+- 检测后交互式选择删除范围
+- TG 推送统计摘要
+- 分钟级定时巡检
+- 支持三种数据来源：
+  - Repository Mode（推荐，管理云端 Git 凭证仓库）
+  - CPA API Mode（远程管理 CPA 当前加载凭证）
+  - Local Directory Mode（本机目录）
+
+---
+
+## 模式说明
 
 ### 1) Repository Mode（推荐）
 管理 Git 仓库中的凭证文件（适合集中管理“云端凭证仓库”）。
 
-- 输入：`--repo-url`（可选 `--git-token`）
+- 输入：`--repo-url` + `--git-token`
 - 输出：检测报告；可按状态删除并执行 `git commit` / `git push`
 
 ### 2) CPA API Mode
@@ -32,122 +100,18 @@
 
 ---
 
-## 安装与运行
+## 常见命令
 
-### 1. 克隆项目
-
-```bash
-git clone https://github.com/constansino/cliproxyapi-credential-batch-manager.git
-cd cliproxyapi-credential-batch-manager
-```
-
-### 2. 直接运行（无需安装）
-
-```bash
-PYTHONPATH=src python3 -m cliproxy_credman --help
-```
-
-### 3. 可选：安装为命令
-
-```bash
-python3 -m pip install -e .
-cliproxy-credman --help
-```
-
----
-
-## 交互式流程（推荐）
-
-交互式流程会在检测后：
-1. 输出状态统计
-2. 让你输入要删除的状态（如 `invalidated,deactivated`）
-3. 让你选择是否先 dry-run
-4. 二次确认后执行删除
-
-```bash
-PYTHONPATH=src python3 -m cliproxy_credman \
-  --repo-url https://github.com/your-org/your-auth-repo.git \
-  --git-token YOUR_GIT_TOKEN \
-  --interactive \
-  --report-file ./repo_report.json
-```
-
-> 说明：`--interactive` 与 `--schedule-minutes` 不能同时使用。
-
-### 菜单交互版（推荐给非命令行用户）
-
-运行后会逐步提问：
-- 选择模式（repo/cpa/local）
-- 填写连接信息
-- 选择是否启用 TG 推送
-- 选择单次或定时
-- 选择删除策略
-
-```bash
-PYTHONPATH=src python3 -m cliproxy_credman --menu
-```
-
----
-
-## Telegram 推送
-
-检测结束后可推送摘要到 TG：
-
-```bash
-PYTHONPATH=src python3 -m cliproxy_credman \
-  --cpa-url http://your-cpa-host:8317 \
-  --management-key YOUR_MANAGEMENT_KEY \
-  --tg-bot-token 123456:ABCDEF_xxx \
-  --tg-chat-id -1001234567890 \
-  --report-file ./cpa_report.json
-```
-
----
-
-## 定时巡检
-
-每 N 分钟执行一次检测（自动覆盖同一个 report 文件）：
-
-```bash
-PYTHONPATH=src python3 -m cliproxy_credman \
-  --repo-url https://github.com/your-org/your-auth-repo.git \
-  --git-token YOUR_GIT_TOKEN \
-  --schedule-minutes 30 \
-  --tg-bot-token 123456:ABCDEF_xxx \
-  --tg-chat-id -1001234567890 \
-  --report-file ./repo_report.json
-```
-
-停止方式：`Ctrl + C`
-
----
-
-## 常见用法
-
-### A. Repository Mode（主推）
+### Repository Mode
 
 #### 仅检测
 
 ```bash
 PYTHONPATH=src python3 -m cliproxy_credman \
   --repo-url https://github.com/your-org/your-auth-repo.git \
-  --repo-branch master \
-  --report-file ./repo_report.json
-```
-
-#### 私有仓库（Git Token）
-
-```bash
-PYTHONPATH=src python3 -m cliproxy_credman \
-  --repo-url https://github.com/your-org/your-auth-repo.git \
-  --repo-branch master \
   --git-token YOUR_GIT_TOKEN \
   --report-file ./repo_report.json
 ```
-
-可选：
-- `--git-token-user`（默认 `x-access-token`）
-- 或通过环境变量 `GIT_TOKEN` 提供 token
 
 #### 非交互删除 + 推送
 
@@ -163,7 +127,7 @@ PYTHONPATH=src python3 -m cliproxy_credman \
   --report-file ./repo_report.json
 ```
 
-### B. CPA API Mode
+### CPA API Mode
 
 ```bash
 PYTHONPATH=src python3 -m cliproxy_credman \
@@ -172,26 +136,13 @@ PYTHONPATH=src python3 -m cliproxy_credman \
   --report-file ./cpa_report.json
 ```
 
-### C. Local Directory Mode
+### Local Directory Mode
 
 ```bash
 PYTHONPATH=src python3 -m cliproxy_credman \
   --auth-dir /data/cli-proxy-api/auths \
   --report-file ./local_report.json
 ```
-
----
-
-## 检测状态
-
-- `active`
-- `invalidated`
-- `deactivated`
-- `expired_by_time`
-- `unauthorized`
-- `missing_token`
-- `check_error`
-- `unknown`
 
 ---
 
@@ -218,6 +169,19 @@ PYTHONPATH=src python3 -m cliproxy_credman \
 
 ---
 
+## 检测状态
+
+- `active`
+- `invalidated`
+- `deactivated`
+- `expired_by_time`
+- `unauthorized`
+- `missing_token`
+- `check_error`
+- `unknown`
+
+---
+
 ## 输出报告
 
 JSON 报告关键字段：
@@ -228,11 +192,21 @@ JSON 报告关键字段：
 
 ---
 
-## 安全
+## 安全建议
 
 - 不输出完整 token。
-- 请勿提交报告文件或私钥。
-- 使用最小权限密钥。
+- 请勿把 `--git-token`、报告文件提交到仓库。
+- 推荐使用环境变量 `GIT_TOKEN` 传递 token。
+
+示例：
+
+```bash
+export GIT_TOKEN='YOUR_GIT_TOKEN'
+PYTHONPATH=src python3 -m cliproxy_credman \
+  --repo-url https://github.com/constansino/conscliproxyapi \
+  --interactive \
+  --report-file ./repo_report.json
+```
 
 ---
 
