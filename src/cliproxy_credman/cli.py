@@ -49,7 +49,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workdir", help="Working directory for cloned repository")
     parser.add_argument("--auth-subdir", default="auths", help="Auth dir under repository")
     parser.add_argument("--timeout", type=int, default=35, help="HTTP timeout seconds")
-    parser.add_argument("--workers", type=int, default=16, help="Concurrent workers")
+    parser.add_argument("--workers", type=int, default=200, help="Concurrent workers (default: 200)")
+    parser.add_argument("--codex-model", default="gpt-5", help="Codex probe model, e.g. gpt-5 or gpt-5.3-codex")
+    parser.add_argument(
+        "--codex-usage-limit-only",
+        action="store_true",
+        help="Only perform Codex usage-limit check (usage_limited vs usage_not_limited); skip non-codex",
+    )
     parser.add_argument("--report-file", default="./cliproxy_credman_report.json", help="Report JSON output path")
     parser.add_argument("--delete-statuses", default="", help="Comma-separated statuses to delete")
     parser.add_argument("--dry-run", action="store_true", help="Preview deletion only")
@@ -69,11 +75,20 @@ def run_command(command: List[str], cwd: Optional[Path] = None, env: Optional[Di
         command,
         cwd=str(cwd) if cwd else None,
         env=env,
-        check=True,
+        check=False,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
     )
+    if completed.returncode != 0:
+        command_text = " ".join(command)
+        stdout_text = completed.stdout.strip()
+        stderr_text = completed.stderr.strip()
+        raise RuntimeError(
+            f"command failed (exit={completed.returncode}): {command_text}\n"
+            f"stdout: {short_text(stdout_text, 400)}\n"
+            f"stderr: {short_text(stderr_text, 1200)}"
+        )
     return completed.stdout.strip()
 
 
@@ -198,16 +213,28 @@ def offline_expired(metadata: Dict[str, Any], now_utc: datetime) -> Tuple[bool, 
     return False, "", access_exp
 
 
-def http_json_request(url: str, method: str, headers: Dict[str, str], body: Optional[bytes], timeout_seconds: int) -> Tuple[int, str]:
+def http_json_request(
+    url: str,
+    method: str,
+    headers: Dict[str, str],
+    body: Optional[bytes],
+    timeout_seconds: int,
+    max_read_bytes: int = 0,
+    skip_success_body: bool = False,
+) -> Tuple[int, str]:
     request = urllib.request.Request(url=url, data=body, method=method)
     for key, value in headers.items():
         request.add_header(key, value)
     try:
         with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
-            text = response.read().decode("utf-8", errors="ignore")
+            if skip_success_body:
+                return response.getcode(), ""
+            data = response.read(max_read_bytes) if max_read_bytes and max_read_bytes > 0 else response.read()
+            text = data.decode("utf-8", errors="ignore")
             return response.getcode(), text
     except urllib.error.HTTPError as err:
-        text = err.read().decode("utf-8", errors="ignore")
+        data = err.read(max_read_bytes) if max_read_bytes and max_read_bytes > 0 else err.read()
+        text = data.decode("utf-8", errors="ignore")
         return err.code, text
 
 
@@ -256,10 +283,21 @@ def cpa_api_call(cpa_url: str, management_key: str, payload: Dict[str, Any], tim
         return 0, response_text
 
 
-def check_codex(metadata: Dict[str, Any], timeout_seconds: int) -> Tuple[str, int, str, str]:
+def build_codex_probe_payload(model: str) -> Dict[str, Any]:
+    target_model = (model or "gpt-5").strip() or "gpt-5"
+    return {
+        "model": target_model,
+        "instructions": "You are a coding assistant.",
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "ping"}]}],
+        "store": False,
+        "stream": True,
+    }
+
+
+def codex_probe_request(metadata: Dict[str, Any], timeout_seconds: int, model: str) -> Tuple[int, str]:
     token = str(metadata.get("access_token") or "").strip()
     if not token:
-        return "missing_token", 0, "access_token is missing", ""
+        return 0, ""
 
     headers = {
         "Authorization": f"Bearer {token}",
@@ -273,11 +311,7 @@ def check_codex(metadata: Dict[str, Any], timeout_seconds: int) -> Tuple[str, in
     if account_id:
         headers["Chatgpt-Account-Id"] = account_id
 
-    payload = {
-        "model": "gpt-4.1-mini",
-        "input": "ping",
-        "stream": False,
-    }
+    payload = build_codex_probe_payload(model)
 
     status_code, response_text = http_json_request(
         url="https://chatgpt.com/backend-api/codex/responses",
@@ -285,18 +319,34 @@ def check_codex(metadata: Dict[str, Any], timeout_seconds: int) -> Tuple[str, in
         headers=headers,
         body=json.dumps(payload).encode("utf-8"),
         timeout_seconds=timeout_seconds,
+        max_read_bytes=512,
+        skip_success_body=True,
     )
+    return status_code, response_text
 
-    lower_text = response_text.lower()
-    if status_code == 401 and ("token_invalidated" in lower_text or "authentication token has been invalidated" in lower_text):
-        return "invalidated", status_code, "codex token invalidated", response_text
-    if status_code == 401 and ("deactivated" in lower_text or "account has been deactivated" in lower_text):
-        return "deactivated", status_code, "codex account deactivated", response_text
-    if status_code == 401:
-        return "unauthorized", status_code, "codex unauthorized", response_text
-    if status_code in (200, 201, 400, 402, 403, 404, 409, 422, 429):
-        return "active", status_code, "codex token appears usable", response_text
-    return "unknown", status_code, "codex unexpected response", response_text
+
+def classify_codex_usage_limit_only(status_code: int, response_text: str) -> Tuple[str, str]:
+    if is_usage_limit_reached(response_text):
+        return "usage_limited", "codex usage limit reached"
+
+    status, reason = classify_codex_response(status_code, response_text)
+    if status == "active":
+        return "usage_not_limited", "codex usage limit not reached"
+    return status, reason
+
+
+def check_codex(metadata: Dict[str, Any], timeout_seconds: int, model: str, usage_limit_only: bool) -> Tuple[str, int, str, str]:
+    token = str(metadata.get("access_token") or "").strip()
+    if not token:
+        return "missing_token", 0, "access_token is missing", ""
+
+    status_code, response_text = codex_probe_request(metadata, timeout_seconds, model)
+
+    if usage_limit_only:
+        status, reason = classify_codex_usage_limit_only(status_code, response_text)
+    else:
+        status, reason = classify_codex_response(status_code, response_text)
+    return status, status_code, reason, response_text
 
 
 def check_google_oauth(metadata: Dict[str, Any], timeout_seconds: int) -> Tuple[str, int, str, str]:
@@ -331,8 +381,35 @@ def classify_codex_response(status_code: int, response_text: str) -> Tuple[str, 
         return "deactivated", "codex account deactivated"
     if status_code == 401:
         return "unauthorized", "codex unauthorized"
-    if status_code in (200, 201, 400, 402, 403, 404, 409, 422, 429):
+    if is_usage_limit_reached(response_text):
+        return "usage_limited", "codex usage limit reached"
+    if status_code == 429:
+        return "rate_limited", "codex rate limited"
+    if "model is not supported when using codex with a chatgpt account" in lower_text:
+        return "model_unsupported", "codex model unsupported for chatgpt account"
+    if (
+        "instructions are required" in lower_text
+        or "input must be a list" in lower_text
+        or "store must be set to false" in lower_text
+        or "stream must be set to true" in lower_text
+    ):
+        return "probe_mismatch", "codex probe payload rejected"
+    if status_code in (200, 201):
         return "active", "codex token appears usable"
+    if status_code == 400:
+        return "bad_request", "codex bad request"
+    if status_code == 402:
+        return "payment_required", "codex payment required"
+    if status_code == 403:
+        return "forbidden", "codex forbidden"
+    if status_code == 404:
+        return "not_found", "codex endpoint not found"
+    if status_code == 409:
+        return "conflict", "codex conflict"
+    if status_code == 422:
+        return "unprocessable", "codex unprocessable request"
+    if status_code >= 500:
+        return "server_error", "codex server error"
     return "unknown", "codex unexpected response"
 
 
@@ -349,7 +426,14 @@ def classify_google_response(status_code: int, response_text: str) -> Tuple[str,
     return "unknown", "google oauth unexpected response"
 
 
-def cpa_check_entry(cpa_url: str, management_key: str, entry: Dict[str, Any], timeout_seconds: int) -> CheckResult:
+def cpa_check_entry(
+    cpa_url: str,
+    management_key: str,
+    entry: Dict[str, Any],
+    timeout_seconds: int,
+    codex_model: str,
+    codex_usage_limit_only: bool,
+) -> CheckResult:
     begin = time.time()
     checked_at = utc_now_text()
 
@@ -389,27 +473,42 @@ def cpa_check_entry(cpa_url: str, management_key: str, entry: Dict[str, Any], ti
                     "Originator": "codex_cli_rs",
                     "User-Agent": "codex_cli_rs/0.98.0",
                 },
-                "data": json.dumps({"model": "gpt-4.1-mini", "input": "ping", "stream": False}),
+                "data": json.dumps(build_codex_probe_payload(codex_model)),
             }
             code, body = cpa_api_call(cpa_url, management_key, payload, timeout_seconds)
-            status, reason = classify_codex_response(code, body)
+            if codex_usage_limit_only:
+                status, reason = classify_codex_usage_limit_only(code, body)
+            else:
+                status, reason = classify_codex_response(code, body)
         elif provider in {"antigravity", "gemini", "gemini-cli"}:
-            payload = {
-                "auth_index": auth_index,
-                "method": "GET",
-                "url": "https://www.googleapis.com/oauth2/v3/userinfo",
-                "header": {
-                    "Authorization": "Bearer $TOKEN$",
-                    "User-Agent": "cliproxy-credman/0.1",
-                },
-            }
-            code, body = cpa_api_call(cpa_url, management_key, payload, timeout_seconds)
-            status, reason = classify_google_response(code, body)
+            if codex_usage_limit_only:
+                code = None
+                body = ""
+                status = "skipped_non_codex"
+                reason = "codex usage-limit mode only checks codex provider"
+            else:
+                payload = {
+                    "auth_index": auth_index,
+                    "method": "GET",
+                    "url": "https://www.googleapis.com/oauth2/v3/userinfo",
+                    "header": {
+                        "Authorization": "Bearer $TOKEN$",
+                        "User-Agent": "cliproxy-credman/0.1",
+                    },
+                }
+                code, body = cpa_api_call(cpa_url, management_key, payload, timeout_seconds)
+                status, reason = classify_google_response(code, body)
         else:
-            code = None
-            body = ""
-            status = "unknown"
-            reason = "unsupported provider in CPA online mode"
+            if codex_usage_limit_only:
+                code = None
+                body = ""
+                status = "skipped_non_codex"
+                reason = "codex usage-limit mode only checks codex provider"
+            else:
+                code = None
+                body = ""
+                status = "unknown"
+                reason = "unsupported provider in CPA online mode"
     except Exception as error:
         code = None
         body = repr(error)
@@ -438,7 +537,23 @@ def short_text(text: str, limit: int = 260) -> str:
     return compact[:limit]
 
 
-def check_credential(path: Path, timeout_seconds: int) -> CheckResult:
+def is_usage_limit_reached(response_text: str) -> bool:
+    lower_text = (response_text or "").lower()
+    if "usage_limit_reached" in lower_text or "usage limit has been reached" in lower_text:
+        return True
+    try:
+        payload = json.loads(response_text or "{}")
+    except Exception:
+        return False
+
+    error_obj = payload.get("error")
+    if isinstance(error_obj, dict):
+        error_type = str(error_obj.get("type") or "").strip().lower()
+        return error_type == "usage_limit_reached"
+    return False
+
+
+def check_credential(path: Path, timeout_seconds: int, codex_model: str, codex_usage_limit_only: bool) -> CheckResult:
     begin = time.time()
     now = datetime.now(timezone.utc)
     checked_at = utc_now_text()
@@ -477,20 +592,28 @@ def check_credential(path: Path, timeout_seconds: int) -> CheckResult:
 
     try:
         if provider == "codex":
-            status, code, reason, response_text = check_codex(metadata, timeout_seconds)
+            status, code, reason, response_text = check_codex(metadata, timeout_seconds, codex_model, codex_usage_limit_only)
             http_status = code if code > 0 else None
             detail = short_text(response_text)
         elif provider in {"antigravity", "gemini", "gemini-cli"}:
-            status, code, reason, response_text = check_google_oauth(metadata, timeout_seconds)
-            http_status = code if code > 0 else None
-            detail = short_text(response_text)
-        else:
-            if expired:
-                status = "expired_by_time"
-                reason = expired_reason
+            if codex_usage_limit_only:
+                status = "skipped_non_codex"
+                reason = "codex usage-limit mode only checks codex provider"
             else:
-                status = "unknown"
-                reason = "online checker not implemented for this provider"
+                status, code, reason, response_text = check_google_oauth(metadata, timeout_seconds)
+                http_status = code if code > 0 else None
+                detail = short_text(response_text)
+        else:
+            if codex_usage_limit_only:
+                status = "skipped_non_codex"
+                reason = "codex usage-limit mode only checks codex provider"
+            else:
+                if expired:
+                    status = "expired_by_time"
+                    reason = expired_reason
+                else:
+                    status = "unknown"
+                    reason = "online checker not implemented for this provider"
     except Exception as error:
         status = "check_error"
         reason = "provider check failed"
@@ -521,10 +644,19 @@ def collect_auth_files(auth_dir: Path) -> List[Path]:
     return sorted(path for path in auth_dir.glob("*.json") if path.is_file())
 
 
-def run_checks(auth_files: List[Path], workers: int, timeout_seconds: int) -> List[CheckResult]:
+def run_checks(
+    auth_files: List[Path],
+    workers: int,
+    timeout_seconds: int,
+    codex_model: str,
+    codex_usage_limit_only: bool,
+) -> List[CheckResult]:
     results: List[CheckResult] = []
     with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
-        futures = [executor.submit(check_credential, auth_file, timeout_seconds) for auth_file in auth_files]
+        futures = [
+            executor.submit(check_credential, auth_file, timeout_seconds, codex_model, codex_usage_limit_only)
+            for auth_file in auth_files
+        ]
         for index, future in enumerate(as_completed(futures), start=1):
             results.append(future.result())
             if index % 50 == 0:
@@ -532,11 +664,27 @@ def run_checks(auth_files: List[Path], workers: int, timeout_seconds: int) -> Li
     return sorted(results, key=lambda item: item.file)
 
 
-def run_checks_cpa(cpa_url: str, management_key: str, entries: List[Dict[str, Any]], workers: int, timeout_seconds: int) -> List[CheckResult]:
+def run_checks_cpa(
+    cpa_url: str,
+    management_key: str,
+    entries: List[Dict[str, Any]],
+    workers: int,
+    timeout_seconds: int,
+    codex_model: str,
+    codex_usage_limit_only: bool,
+) -> List[CheckResult]:
     results: List[CheckResult] = []
     with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
         futures = [
-            executor.submit(cpa_check_entry, cpa_url, management_key, entry, timeout_seconds)
+            executor.submit(
+                cpa_check_entry,
+                cpa_url,
+                management_key,
+                entry,
+                timeout_seconds,
+                codex_model,
+                codex_usage_limit_only,
+            )
             for entry in entries
         ]
         for index, future in enumerate(as_completed(futures), start=1):
@@ -652,6 +800,58 @@ def delete_credentials_local_by_names(
     return deleted
 
 
+def git_push_with_fallback(repo_dir: Path, git_env: Dict[str, str]) -> None:
+    branch = ""
+    try:
+        branch = run_command(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=repo_dir, env=git_env).strip()
+    except Exception:
+        branch = ""
+
+    commands: List[List[str]] = [["git", "push"]]
+    if branch and branch != "HEAD":
+        commands.append(["git", "push", "-u", "origin", branch])
+        commands.append(
+            [
+                "git",
+                "-c",
+                "http.version=HTTP/1.1",
+                "-c",
+                "http.postBuffer=524288000",
+                "-c",
+                "core.compression=0",
+                "push",
+                "origin",
+                branch,
+            ]
+        )
+    else:
+        commands.append(
+            [
+                "git",
+                "-c",
+                "http.version=HTTP/1.1",
+                "-c",
+                "http.postBuffer=524288000",
+                "-c",
+                "core.compression=0",
+                "push",
+            ]
+        )
+
+    errors: List[str] = []
+    for index, command in enumerate(commands, start=1):
+        try:
+            run_command(command, cwd=repo_dir, env=git_env)
+            return
+        except Exception as error:
+            errors.append(f"[attempt {index}] {short_text(str(error), 1200)}")
+            if index < len(commands):
+                print(f"git push failed on attempt {index}, retrying with fallback...")
+                time.sleep(min(8, index * 2))
+
+    raise RuntimeError("git push failed after fallback attempts:\n" + "\n".join(errors))
+
+
 def git_commit_and_push(
     repo_dir: Path,
     git_env: Dict[str, str],
@@ -665,6 +865,7 @@ def git_commit_and_push(
         "committed": False,
         "pushed": False,
         "commit_id": "",
+        "push_error": "",
     }
 
     run_command(["git", "add", "-A"], cwd=repo_dir, env=git_env)
@@ -688,8 +889,12 @@ def git_commit_and_push(
         outcome["commit_id"] = commit_id
 
         if do_push:
-            run_command(["git", "push"], cwd=repo_dir, env=git_env)
-            outcome["pushed"] = True
+            try:
+                git_push_with_fallback(repo_dir=repo_dir, git_env=git_env)
+                outcome["pushed"] = True
+            except Exception as error:
+                outcome["push_error"] = short_text(str(error), 2000)
+                print(f"git push failed: {outcome['push_error']}")
 
     return outcome
 
@@ -698,6 +903,8 @@ def print_summary(report: Dict[str, Any]) -> None:
     print("\n=== Summary ===")
     print(f"checked_at: {report['checked_at_utc']}")
     print(f"mode: {report.get('mode', '')}")
+    print(f"codex_model: {report.get('codex_model', '')}")
+    print(f"codex_usage_limit_only: {report.get('codex_usage_limit_only', False)}")
     if report.get("mode") == "cpa":
         print(f"cpa_url: {report.get('cpa_url', '')}")
     else:
@@ -708,6 +915,9 @@ def print_summary(report: Dict[str, Any]) -> None:
         print(f"  - {status}: {count}")
     if report["deleted_files"]:
         print(f"deleted: {len(report['deleted_files'])}")
+    push_error = str(report.get("git", {}).get("push_error") or "").strip()
+    if push_error:
+        print(f"git_push_error: {push_error}")
 
 
 def prompt_yes_no(question: str, default_no: bool = True) -> bool:
@@ -768,7 +978,12 @@ def apply_menu_configuration(args: argparse.Namespace) -> argparse.Namespace:
 
     args.workers = int(prompt_input("并发 workers", str(args.workers)))
     args.timeout = int(prompt_input("请求超时秒数", str(args.timeout)))
+    args.codex_model = prompt_input("Codex 探测模型", args.codex_model or "gpt-5")
+    args.codex_usage_limit_only = prompt_yes_no("仅做 Codex usage-limit 检查（非 codex 跳过）？", default_no=True)
     args.report_file = prompt_input("报告输出文件", args.report_file)
+    default_delete_statuses = (
+        "usage_limited" if args.codex_usage_limit_only else "invalidated,deactivated,expired_by_time,unauthorized"
+    )
 
     enable_tg = prompt_yes_no("是否启用 Telegram 推送？", default_no=True)
     if enable_tg:
@@ -808,14 +1023,14 @@ def apply_menu_configuration(args: argparse.Namespace) -> argparse.Namespace:
     if delete_mode == "2":
         if args.schedule_minutes > 0:
             print("定时模式不支持交互删除，已切换为固定状态 dry-run。")
-            args.delete_statuses = "invalidated,deactivated,expired_by_time,unauthorized"
+            args.delete_statuses = default_delete_statuses
             args.dry_run = True
         else:
             args.interactive = True
     elif delete_mode == "3":
         args.delete_statuses = prompt_input(
             "输入要处理的状态（逗号分隔）",
-            "invalidated,deactivated,expired_by_time,unauthorized",
+            default_delete_statuses,
         )
         args.dry_run = prompt_yes_no("是否 dry-run（只预演不删除）？", default_no=False)
 
@@ -833,7 +1048,8 @@ def interactive_delete_statuses(results: List[CheckResult]) -> Tuple[List[str], 
     for status, count in status_counts.items():
         print(f"  - {status}: {count}")
 
-    suggested = [status for status in ["invalidated", "deactivated", "expired_by_time", "unauthorized"] if status_counts.get(status, 0) > 0]
+    suggested_order = ["usage_limited", "invalidated", "deactivated", "expired_by_time", "unauthorized"]
+    suggested = [status for status in suggested_order if status_counts.get(status, 0) > 0]
     default_text = ",".join(suggested)
     raw = input(f"\n输入要删除的状态（逗号分隔，直接回车=不删除）[{default_text}]: ").strip()
     selected_text = raw or default_text
@@ -943,7 +1159,7 @@ def interactive_manage_and_delete(
 ) -> Tuple[List[str], List[str], Dict[str, Any], bool]:
     deleted_files: List[str] = []
     affected_statuses: List[str] = []
-    git_result: Dict[str, Any] = {"committed": False, "pushed": False, "commit_id": ""}
+    git_result: Dict[str, Any] = {"committed": False, "pushed": False, "commit_id": "", "push_error": ""}
 
     while True:
         grouped = group_results_by_status(results)
@@ -1087,7 +1303,15 @@ def run_once(args: argparse.Namespace) -> Dict[str, Any]:
             if not entries:
                 raise ValueError("no credentials returned by CPA /v0/management/auth-files")
             print(f"checking {len(entries)} credentials from CPA: {args.cpa_url}")
-            results = run_checks_cpa(args.cpa_url, args.management_key, entries, workers=args.workers, timeout_seconds=args.timeout)
+            results = run_checks_cpa(
+                args.cpa_url,
+                args.management_key,
+                entries,
+                workers=args.workers,
+                timeout_seconds=args.timeout,
+                codex_model=args.codex_model,
+                codex_usage_limit_only=args.codex_usage_limit_only,
+            )
             auth_dir = Path("")
             repo_mode = False
         else:
@@ -1097,12 +1321,18 @@ def run_once(args: argparse.Namespace) -> Dict[str, Any]:
             if not auth_files:
                 raise ValueError(f"no json files found under {auth_dir}")
             print(f"checking {len(auth_files)} credentials from: {auth_dir}")
-            results = run_checks(auth_files, workers=args.workers, timeout_seconds=args.timeout)
+            results = run_checks(
+                auth_files,
+                workers=args.workers,
+                timeout_seconds=args.timeout,
+                codex_model=args.codex_model,
+                codex_usage_limit_only=args.codex_usage_limit_only,
+            )
 
         delete_statuses = parse_delete_statuses(args.delete_statuses)
         run_dry_run = bool(args.dry_run)
         deleted_files: List[str] = []
-        git_result: Dict[str, Any] = {"committed": False, "pushed": False, "commit_id": ""}
+        git_result: Dict[str, Any] = {"committed": False, "pushed": False, "commit_id": "", "push_error": ""}
 
         if args.interactive:
             delete_statuses, deleted_files, git_result, run_dry_run = interactive_manage_and_delete(
@@ -1160,6 +1390,8 @@ def run_once(args: argparse.Namespace) -> Dict[str, Any]:
             "checked_at_utc": utc_now_text(),
             "duration_seconds": round(time.time() - started_at, 3),
             "mode": "cpa" if cpa_mode else ("repo" if repo_mode else "local"),
+            "codex_model": args.codex_model,
+            "codex_usage_limit_only": bool(args.codex_usage_limit_only),
             "cpa_url": args.cpa_url or "",
             "auth_dir": str(auth_dir) if not cpa_mode else "",
             "total": len(results),

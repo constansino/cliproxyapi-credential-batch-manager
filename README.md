@@ -140,6 +140,7 @@ PYTHONPATH=src python3 -m cliproxy_credman \
 PYTHONPATH=src python3 -m cliproxy_credman \
   --repo-url https://github.com/your-org/your-auth-repo.git \
   --git-token YOUR_GIT_TOKEN \
+  --codex-model gpt-5 \
   --delete-statuses invalidated,deactivated,expired_by_time,unauthorized \
   --git-commit \
   --git-push \
@@ -147,6 +148,8 @@ PYTHONPATH=src python3 -m cliproxy_credman \
   --git-author-email "cred-bot@example.com" \
   --report-file ./repo_report.json
 ```
+
+说明：大批量删除后 `git push` 失败时，脚本会自动做多轮 fallback（普通 push、`-u origin <branch>`、HTTP/1.1 + 大缓冲）。若仍失败，不会中断整轮检测，错误会写入 `report.git.push_error`。
 
 ### CPA API Mode
 
@@ -165,6 +168,34 @@ PYTHONPATH=src python3 -m cliproxy_credman \
   --report-file ./local_report.json
 ```
 
+#### 仅做 Codex usage-limit 检查（筛选 `The usage limit has been reached`）
+
+```bash
+PYTHONPATH=src python3 -m cliproxy_credman \
+  --auth-dir /data/cli-proxy-api/auths \
+  --codex-model gpt-5 \
+  --codex-usage-limit-only \
+  --report-file ./usage_limit_report.json
+```
+
+### Windows PowerShell 用法（仓库模式 + 交互删除）
+
+```powershell
+Set-Location "C:\Users\1\Downloads\cliproxyapi-credential-batch-manager"
+$env:PYTHONPATH = "src"
+
+python -m cliproxy_credman `
+  --repo-url "https://github.com/your-org/your-auth-repo" `
+  --git-token "YOUR_GIT_TOKEN" `
+  --workers 200 `
+  --codex-model gpt-5 `
+  --codex-usage-limit-only `
+  --interactive `
+  --git-commit `
+  --git-push `
+  --report-file ".\report.json"
+```
+
 ---
 
 ## 参数
@@ -176,8 +207,10 @@ PYTHONPATH=src python3 -m cliproxy_credman \
 - 执行控制：
   - `--interactive`
   - `--schedule-minutes`
-  - `--workers`
+  - `--workers`（默认 `200`）
   - `--timeout`
+  - `--codex-model`（默认 `gpt-5`）
+  - `--codex-usage-limit-only`（仅检查 codex 的 usage limit，非 codex 直接跳过）
 - 删除相关：
   - `--delete-statuses`
   - `--dry-run`
@@ -193,6 +226,18 @@ PYTHONPATH=src python3 -m cliproxy_credman \
 ## 检测状态
 
 - `active`
+- `usage_limited`（例如 `error.type=usage_limit_reached`）
+- `usage_not_limited`（仅在 `--codex-usage-limit-only` 下出现）
+- `rate_limited`
+- `model_unsupported`
+- `probe_mismatch`
+- `bad_request`
+- `payment_required`
+- `forbidden`
+- `not_found`
+- `conflict`
+- `unprocessable`
+- `server_error`
 - `invalidated`
 - `deactivated`
 - `expired_by_time`
@@ -200,6 +245,7 @@ PYTHONPATH=src python3 -m cliproxy_credman \
 - `missing_token`
 - `check_error`
 - `unknown`
+- `skipped_non_codex`（仅在 `--codex-usage-limit-only` 下出现）
 
 ---
 
@@ -208,6 +254,8 @@ PYTHONPATH=src python3 -m cliproxy_credman \
 JSON 报告关键字段：
 
 - `mode`：`repo` / `cpa` / `local`
+- `codex_model`
+- `codex_usage_limit_only`
 - `summary.by_status`
 - `results[]`：`file`, `provider`, `status`, `http_status`, `reason`, `detail`
 
