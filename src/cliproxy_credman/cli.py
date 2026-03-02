@@ -213,6 +213,86 @@ def offline_expired(metadata: Dict[str, Any], now_utc: datetime) -> Tuple[bool, 
     return False, "", access_exp
 
 
+def pick_non_empty_string(*values: Any) -> str:
+    for value in values:
+        if isinstance(value, str):
+            text = value.strip()
+            if text:
+                return text
+    return ""
+
+
+def nested_token_object(metadata: Dict[str, Any]) -> Dict[str, Any]:
+    token_value = metadata.get("token")
+    if isinstance(token_value, dict):
+        return token_value
+    return {}
+
+
+def resolve_access_token(metadata: Dict[str, Any]) -> str:
+    token_obj = nested_token_object(metadata)
+    return pick_non_empty_string(metadata.get("access_token"), token_obj.get("access_token"))
+
+
+def resolve_google_refresh_payload(metadata: Dict[str, Any]) -> Tuple[str, str, str, str]:
+    token_obj = nested_token_object(metadata)
+    refresh_token = pick_non_empty_string(metadata.get("refresh_token"), token_obj.get("refresh_token"))
+    client_id = pick_non_empty_string(metadata.get("client_id"), token_obj.get("client_id"))
+    client_secret = pick_non_empty_string(metadata.get("client_secret"), token_obj.get("client_secret"))
+    token_uri = pick_non_empty_string(metadata.get("token_uri"), token_obj.get("token_uri"))
+    if not token_uri:
+        token_uri = "https://oauth2.googleapis.com/token"
+    return refresh_token, client_id, client_secret, token_uri
+
+
+def refresh_google_access_token(metadata: Dict[str, Any], timeout_seconds: int) -> Tuple[str, int, str, str]:
+    refresh_token, client_id, client_secret, token_uri = resolve_google_refresh_payload(metadata)
+    if not refresh_token:
+        return "", 0, "google refresh_token is missing", ""
+    if not client_id or not client_secret:
+        return "", 0, "google client credentials are missing", ""
+
+    payload = urllib.parse.urlencode(
+        {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": client_id,
+            "client_secret": client_secret,
+        }
+    ).encode("utf-8")
+
+    status_code, response_text = http_json_request(
+        url=token_uri,
+        method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        body=payload,
+        timeout_seconds=timeout_seconds,
+    )
+    if status_code != 200:
+        return "", status_code, "google refresh failed", response_text
+
+    try:
+        data = json.loads(response_text or "{}")
+    except Exception:
+        return "", status_code, "google refresh returned non-json payload", response_text
+
+    new_access_token = pick_non_empty_string(data.get("access_token"))
+    if not new_access_token:
+        return "", status_code, "google refresh response missing access_token", response_text
+    return new_access_token, status_code, "google refresh succeeded", response_text
+
+
+def google_tokeninfo_request(token: str, timeout_seconds: int) -> Tuple[int, str]:
+    query = urllib.parse.urlencode({"access_token": token})
+    return http_json_request(
+        url=f"https://oauth2.googleapis.com/tokeninfo?{query}",
+        method="GET",
+        headers={},
+        body=None,
+        timeout_seconds=timeout_seconds,
+    )
+
+
 def http_json_request(
     url: str,
     method: str,
@@ -350,22 +430,41 @@ def check_codex(metadata: Dict[str, Any], timeout_seconds: int, model: str, usag
 
 
 def check_google_oauth(metadata: Dict[str, Any], timeout_seconds: int) -> Tuple[str, int, str, str]:
-    token = str(metadata.get("access_token") or "").strip()
+    token = resolve_access_token(metadata)
     if not token:
-        return "missing_token", 0, "access_token is missing", ""
+        refreshed_token, refresh_code, refresh_reason, refresh_text = refresh_google_access_token(
+            metadata, timeout_seconds
+        )
+        if not refreshed_token:
+            if "refresh_token is missing" in refresh_reason or "client credentials are missing" in refresh_reason:
+                return "missing_token", 0, "access_token is missing", ""
+            return "unknown", refresh_code if refresh_code > 0 else 0, refresh_reason, refresh_text
+        token = refreshed_token
 
-    query = urllib.parse.urlencode({"access_token": token})
-    status_code, response_text = http_json_request(
-        url=f"https://oauth2.googleapis.com/tokeninfo?{query}",
-        method="GET",
-        headers={},
-        body=None,
-        timeout_seconds=timeout_seconds,
-    )
+    status_code, response_text = google_tokeninfo_request(token, timeout_seconds)
 
     lower_text = response_text.lower()
     if status_code == 200:
         return "active", status_code, "google tokeninfo accepted token", response_text
+
+    if status_code in (400, 401):
+        refreshed_token, refresh_code, refresh_reason, refresh_text = refresh_google_access_token(metadata, timeout_seconds)
+        if refreshed_token:
+            status_code, response_text = google_tokeninfo_request(refreshed_token, timeout_seconds)
+            lower_text = response_text.lower()
+            if status_code == 200:
+                return "active", status_code, "google token refreshed and accepted", response_text
+            if status_code == 400 and ("invalid_token" in lower_text or "invalid" in lower_text):
+                return "invalidated", status_code, "google token invalid after refresh", response_text
+            if status_code == 401:
+                return "unauthorized", status_code, "google token unauthorized after refresh", response_text
+            return "unknown", status_code, "google tokeninfo unexpected response after refresh", response_text
+
+        if refresh_code > 0 and refresh_reason == "google refresh failed":
+            refresh_lower = (refresh_text or "").lower()
+            if "invalid_grant" in refresh_lower:
+                return "invalidated", refresh_code, "google refresh token invalid", refresh_text
+
     if status_code == 400 and ("invalid_token" in lower_text or "invalid" in lower_text):
         return "invalidated", status_code, "google token invalid", response_text
     if status_code == 401:
