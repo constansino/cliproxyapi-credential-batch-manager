@@ -2,6 +2,29 @@
 
 用于批量检测与清理 CLIProxyAPI 凭证（`auths/*.json`）。
 
+## Web 版本（Vercel）
+
+仓库内已提供 Web 版：`web/`。支持：
+
+- 上传 `auths.zip` 批量检查
+- 输出 `summary.by_status / by_provider`
+- 选择状态后导出“清理后 zip”
+- 支持“仅删 Codex”范围
+
+本地启动：
+
+```powershell
+Set-Location "C:\Users\1\Downloads\cliproxyapi-credential-batch-manager\web"
+npm install
+npm run dev
+```
+
+部署到 Vercel（在 `web` 目录执行）：
+
+```powershell
+npx vercel --prod
+```
+
 ## 最常用（Linux/macOS）
 
 先克隆：

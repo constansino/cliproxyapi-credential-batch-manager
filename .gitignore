@@ -7,4 +7,7 @@ dist/
 build/
 *.egg-info/
 cliproxy_credman_report.json
+web/node_modules/
+web/.next/
+web/.vercel/
 
