@@ -31,6 +31,12 @@ interface RepoFileEntry {
   sha: string;
 }
 
+interface GitTreeEntry {
+  path: string;
+  type: "tree" | "blob";
+  sha: string;
+}
+
 interface NormalizedRepoConfig {
   repoUrl: string;
   githubToken: string;
@@ -817,59 +823,147 @@ async function githubRequest(
   return payload;
 }
 
-function toFileEntry(value: unknown): RepoFileEntry | null {
-  const obj = asObject(value);
-  if (!obj) {
-    return null;
-  }
-  const type = String(obj.type || "");
-  const path = String(obj.path || "");
-  const name = String(obj.name || "");
-  const sha = String(obj.sha || "");
-  if (type !== "file" || !path || !name || !sha) {
-    return null;
-  }
-  return { path, name, sha };
+function buildRepoGitUrl(config: NormalizedRepoConfig, suffix: string): string {
+  const base = `https://api.github.com/repos/${encodeURIComponent(config.owner)}/${encodeURIComponent(config.repo)}`;
+  return `${base}${suffix}`;
 }
 
-async function listRepoJsonFiles(config: NormalizedRepoConfig): Promise<RepoFileEntry[]> {
-  const queue: string[] = [config.authSubdir];
-  const seenDirs = new Set<string>();
+function parseGitTreePayload(payload: unknown): { entries: GitTreeEntry[]; truncated: boolean } {
+  const obj = asObject(payload);
+  if (!obj) {
+    throw new Error("GitHub tree 返回格式异常");
+  }
+  const tree = obj.tree;
+  if (!Array.isArray(tree)) {
+    throw new Error("GitHub tree 缺少 tree[]");
+  }
+  const truncated = Boolean(obj.truncated);
+  const entries: GitTreeEntry[] = [];
+  for (const item of tree) {
+    const entry = asObject(item);
+    if (!entry) {
+      continue;
+    }
+    const path = String(entry.path || "");
+    const type = String(entry.type || "");
+    const sha = String(entry.sha || "");
+    if (!path || !sha || (type !== "tree" && type !== "blob")) {
+      continue;
+    }
+    entries.push({ path, type: type as "tree" | "blob", sha });
+  }
+  return { entries, truncated };
+}
+
+async function getBranchCommitSha(config: NormalizedRepoConfig): Promise<string> {
+  const payload = await githubRequest(
+    config,
+    buildRepoGitUrl(config, `/branches/${encodeURIComponent(config.branch)}`),
+    "GET"
+  );
+  const obj = asObject(payload);
+  const commit = asObject(obj?.commit);
+  const sha = String(commit?.sha || "");
+  if (!sha) {
+    throw new Error(`无法读取分支 ${config.branch} 的 commit sha`);
+  }
+  return sha;
+}
+
+async function getCommitTreeSha(config: NormalizedRepoConfig, commitSha: string): Promise<string> {
+  const payload = await githubRequest(
+    config,
+    buildRepoGitUrl(config, `/git/commits/${encodeURIComponent(commitSha)}`),
+    "GET"
+  );
+  const obj = asObject(payload);
+  const tree = asObject(obj?.tree);
+  const sha = String(tree?.sha || "");
+  if (!sha) {
+    throw new Error(`无法读取 commit ${commitSha} 的 tree sha`);
+  }
+  return sha;
+}
+
+async function getTree(config: NormalizedRepoConfig, treeSha: string, recursive: boolean): Promise<{ entries: GitTreeEntry[]; truncated: boolean }> {
+  const url = buildRepoGitUrl(
+    config,
+    `/git/trees/${encodeURIComponent(treeSha)}${recursive ? "?recursive=1" : ""}`
+  );
+  const payload = await githubRequest(config, url, "GET");
+  return parseGitTreePayload(payload);
+}
+
+async function findSubtreeSha(config: NormalizedRepoConfig, rootTreeSha: string, dirPath: string): Promise<string> {
+  const segments = dirPath
+    .split("/")
+    .map((segment) => segment.trim())
+    .filter(Boolean);
+
+  let currentSha = rootTreeSha;
+  for (const segment of segments) {
+    const { entries } = await getTree(config, currentSha, false);
+    const next = entries.find((entry) => entry.type === "tree" && entry.path === segment);
+    if (!next) {
+      throw new Error(`仓库目录不存在: ${dirPath}`);
+    }
+    currentSha = next.sha;
+  }
+  return currentSha;
+}
+
+async function listRepoJsonFilesByTreeBfs(
+  config: NormalizedRepoConfig,
+  rootTreeSha: string,
+  rootPath: string
+): Promise<RepoFileEntry[]> {
+  const queue: Array<{ sha: string; prefix: string }> = [{ sha: rootTreeSha, prefix: rootPath }];
   const files: RepoFileEntry[] = [];
 
   while (queue.length > 0) {
-    const current = queue.shift() || "";
-    if (seenDirs.has(current)) {
-      continue;
-    }
-    seenDirs.add(current);
-
-    const payload = await githubRequest(config, buildRepoContentsUrl(config, current), "GET");
-    const items = Array.isArray(payload) ? payload : [payload];
-    for (const item of items) {
-      const obj = asObject(item);
-      if (!obj) {
+    const current = queue.shift()!;
+    const { entries } = await getTree(config, current.sha, false);
+    for (const entry of entries) {
+      const fullPath = current.prefix ? `${current.prefix}/${entry.path}` : entry.path;
+      if (entry.type === "tree") {
+        queue.push({ sha: entry.sha, prefix: fullPath });
         continue;
       }
-      const itemType = String(obj.type || "");
-      const itemPath = String(obj.path || "");
-      const itemName = String(obj.name || "");
-      if (!itemType || !itemPath) {
+      if (!fullPath.toLowerCase().endsWith(".json")) {
         continue;
       }
-      if (itemType === "dir") {
-        queue.push(itemPath);
-        continue;
-      }
-      if (itemType !== "file" || !itemName.toLowerCase().endsWith(".json")) {
-        continue;
-      }
-      const file = toFileEntry(item);
-      if (file) {
-        files.push(file);
-      }
+      files.push({
+        path: fullPath,
+        name: fullPath.split("/").at(-1) || fullPath,
+        sha: entry.sha
+      });
     }
   }
+  return files;
+}
+
+async function listRepoJsonFiles(config: NormalizedRepoConfig): Promise<RepoFileEntry[]> {
+  const commitSha = await getBranchCommitSha(config);
+  const repoRootTreeSha = await getCommitTreeSha(config, commitSha);
+  const authTreeSha = await findSubtreeSha(config, repoRootTreeSha, config.authSubdir);
+
+  const recursive = await getTree(config, authTreeSha, true);
+  let files: RepoFileEntry[] = [];
+
+  if (!recursive.truncated) {
+    const rootPrefix = config.authSubdir ? `${config.authSubdir}/` : "";
+    files = recursive.entries
+      .filter((entry) => entry.type === "blob")
+      .map((entry) => ({
+        path: rootPrefix ? `${rootPrefix}${entry.path}` : entry.path,
+        name: entry.path.split("/").at(-1) || entry.path,
+        sha: entry.sha
+      }))
+      .filter((entry) => entry.path.toLowerCase().endsWith(".json"));
+  } else {
+    files = await listRepoJsonFilesByTreeBfs(config, authTreeSha, config.authSubdir);
+  }
+
   return files.sort((a, b) => a.path.localeCompare(b.path));
 }
 
