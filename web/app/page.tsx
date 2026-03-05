@@ -1,7 +1,7 @@
 "use client";
 
 import { FormEvent, useEffect, useMemo, useState } from "react";
-import { CheckReport, CleanupResultRef, ProviderScope } from "@/lib/types";
+import { CheckReport, CheckResult, CheckSummary, CleanupResultRef, ProviderScope } from "@/lib/types";
 
 const DEFAULT_DELETE_STATUSES = [
   "invalidated",
@@ -13,6 +13,10 @@ const DEFAULT_DELETE_STATUSES = [
 ];
 const DEFAULT_IMPORT_STATUSES = ["usage_not_limited", "active"];
 const TABLE_LIMIT = 200;
+
+function utcNowText(date: Date = new Date()): string {
+  return date.toISOString().replace("T", " ").replace(/\.\d{3}Z$/, " UTC");
+}
 
 function classForStatus(status: string): string {
   if (status === "active" || status === "usage_not_limited") {
@@ -39,6 +43,81 @@ function toResultRefs(report: CheckReport): CleanupResultRef[] {
     status: item.status,
     provider: item.provider
   }));
+}
+
+function summarizeResults(results: CheckResult[]): CheckSummary {
+  const byStatus: Record<string, number> = {};
+  const byProvider: Record<string, number> = {};
+  const byProviderStatus: Record<string, Record<string, number>> = {};
+
+  for (const item of results) {
+    byStatus[item.status] = (byStatus[item.status] || 0) + 1;
+    byProvider[item.provider] = (byProvider[item.provider] || 0) + 1;
+    byProviderStatus[item.provider] ||= {};
+    byProviderStatus[item.provider][item.status] = (byProviderStatus[item.provider][item.status] || 0) + 1;
+  }
+
+  return {
+    by_status: Object.fromEntries(Object.entries(byStatus).sort(([a], [b]) => a.localeCompare(b))),
+    by_provider: Object.fromEntries(Object.entries(byProvider).sort(([a], [b]) => a.localeCompare(b))),
+    by_provider_status: Object.fromEntries(
+      Object.entries(byProviderStatus)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([provider, statuses]) => [
+          provider,
+          Object.fromEntries(Object.entries(statuses).sort(([a], [b]) => a.localeCompare(b)))
+        ])
+    )
+  };
+}
+
+function mergeUploadReports(reports: CheckReport[], codexModel: string, codexUsageLimitOnly: boolean): CheckReport {
+  const results = reports
+    .flatMap((item) => item.results)
+    .sort((a, b) => {
+      if (a.source !== b.source) {
+        return a.source.localeCompare(b.source);
+      }
+      if (a.file !== b.file) {
+        return a.file.localeCompare(b.file);
+      }
+      return a.path.localeCompare(b.path);
+    });
+
+  return {
+    checked_at_utc: utcNowText(),
+    duration_seconds: Number(reports.reduce((sum, item) => sum + item.duration_seconds, 0).toFixed(3)),
+    mode: "upload",
+    source_label: `upload:${reports.length} archive(s)`,
+    codex_model: codexModel,
+    codex_usage_limit_only: codexUsageLimitOnly,
+    total: results.length,
+    summary: summarizeResults(results),
+    results
+  };
+}
+
+function mapResponseTextToError(status: number, text: string): string {
+  const preview = (text || "").trim();
+  if (status === 413 || /request entity too large|payload too large/i.test(preview)) {
+    return "上传体积超过限制（Vercel 限制），请减少单次 zip 数量或分批检查。";
+  }
+  if (!preview) {
+    return `请求失败（HTTP ${status}）`;
+  }
+  return `请求失败（HTTP ${status}）：${preview.slice(0, 180)}`;
+}
+
+async function parseApiResponse(response: Response): Promise<Record<string, unknown>> {
+  const text = await response.text();
+  if (!text) {
+    return {};
+  }
+  try {
+    return JSON.parse(text) as Record<string, unknown>;
+  } catch {
+    throw new Error(mapResponseTextToError(response.status, text));
+  }
 }
 
 export default function HomePage(): React.ReactElement {
@@ -159,7 +238,7 @@ export default function HomePage(): React.ReactElement {
   }, [report, statusKeys]);
 
   useEffect(() => {
-    if (!isChecking) {
+    if (!isCheckingRepo) {
       return;
     }
     setCheckProgress((prev) => Math.max(prev, 4));
@@ -173,7 +252,7 @@ export default function HomePage(): React.ReactElement {
       });
     }, 450);
     return () => window.clearInterval(timer);
-  }, [isChecking]);
+  }, [isCheckingRepo]);
 
   useEffect(() => {
     if (isChecking || checkProgress <= 0) {
@@ -244,25 +323,32 @@ export default function HomePage(): React.ReactElement {
     setCheckProgress(4);
     setIsCheckingUpload(true);
     try {
-      const form = new FormData();
-      for (const archive of archives) {
+      const partialReports: CheckReport[] = [];
+      for (let index = 0; index < archives.length; index += 1) {
+        const archive = archives[index];
+        setCheckProgressLabel(`正在检查上传包 ${index + 1}/${archives.length}: ${archive.name}`);
+        const form = new FormData();
         form.append("archives", archive);
-      }
-      form.append("codexModel", codexModel);
-      form.append("timeoutSeconds", String(timeoutSeconds));
-      form.append("workers", String(workers));
-      form.append("codexUsageLimitOnly", String(codexUsageLimitOnly));
+        form.append("codexModel", codexModel);
+        form.append("timeoutSeconds", String(timeoutSeconds));
+        form.append("workers", String(workers));
+        form.append("codexUsageLimitOnly", String(codexUsageLimitOnly));
 
-      const response = await fetch("/api/check", {
-        method: "POST",
-        body: form
-      });
-      const payload = await response.json();
-      if (!response.ok) {
-        throw new Error(String(payload?.error || "检查失败"));
+        const response = await fetch("/api/check", {
+          method: "POST",
+          body: form
+        });
+        const payload = await parseApiResponse(response);
+        if (!response.ok) {
+          throw new Error(`${archive.name} 检查失败：${String(payload?.error || "未知错误")}`);
+        }
+        partialReports.push(payload as unknown as CheckReport);
+        setCheckProgress(Math.min(95, Math.max(8, Math.round(((index + 1) / archives.length) * 95))));
       }
-      setReport(payload as CheckReport);
-      setNotice(`上传检查完成，共 ${payload.total} 条凭证。`);
+
+      const mergedReport = mergeUploadReports(partialReports, codexModel, codexUsageLimitOnly);
+      setReport(mergedReport);
+      setNotice(`上传检查完成，共 ${mergedReport.total} 条凭证。`);
     } catch (err) {
       const message = err instanceof Error ? err.message : "检查失败";
       setError(message);
@@ -294,11 +380,11 @@ export default function HomePage(): React.ReactElement {
           codexUsageLimitOnly
         })
       });
-      const payload = await response.json();
+      const payload = await parseApiResponse(response);
       if (!response.ok) {
         throw new Error(String(payload?.error || "仓库检查失败"));
       }
-      setReport(payload as CheckReport);
+      setReport(payload as unknown as CheckReport);
       setNotice(`仓库检查完成，共 ${payload.total} 条凭证。`);
     } catch (err) {
       setError(err instanceof Error ? err.message : "仓库检查失败");
@@ -339,7 +425,7 @@ export default function HomePage(): React.ReactElement {
         body: form
       });
       if (!response.ok) {
-        const payload = await response.json().catch(() => ({}));
+        const payload = await parseApiResponse(response);
         throw new Error(String(payload?.error || "清理失败"));
       }
 
@@ -397,7 +483,7 @@ export default function HomePage(): React.ReactElement {
         method: "POST",
         body: form
       });
-      const payload = await response.json();
+      const payload = await parseApiResponse(response);
       if (!response.ok) {
         throw new Error(String(payload?.error || "导入失败"));
       }
@@ -439,7 +525,7 @@ export default function HomePage(): React.ReactElement {
           resultRefs: toResultRefs(report)
         })
       });
-      const payload = await response.json();
+      const payload = await parseApiResponse(response);
       if (!response.ok) {
         throw new Error(String(payload?.error || "删除失败"));
       }
