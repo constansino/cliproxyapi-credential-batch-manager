@@ -1,12 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
-import { cleanupArchiveCredentials } from "@/lib/checker";
+import { importCredentialsToGithubRepo } from "@/lib/checker";
 import { ArchiveInput, CleanupResultRef, ProviderScope } from "@/lib/types";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-export const maxDuration = 120;
+export const maxDuration = 300;
 
-function parseDeleteStatuses(raw: string): string[] {
+function parseStatuses(raw: string): string[] {
   return Array.from(
     new Set(
       raw
@@ -24,18 +24,12 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       .getAll("archives")
       .filter((item): item is File => item instanceof File);
     if (archiveFiles.length === 0) {
-      const legacyArchive = formData.get("archive");
-      if (legacyArchive instanceof File) {
-        archiveFiles.push(legacyArchive);
-      }
-    }
-    if (archiveFiles.length === 0) {
-      return NextResponse.json({ error: "缺少 archive 文件，至少上传一个 zip" }, { status: 400 });
+      return NextResponse.json({ error: "导入需要上传至少一个 zip" }, { status: 400 });
     }
 
-    const deleteStatuses = parseDeleteStatuses(String(formData.get("deleteStatuses") || ""));
-    if (deleteStatuses.length === 0) {
-      return NextResponse.json({ error: "deleteStatuses 不能为空" }, { status: 400 });
+    const importStatuses = parseStatuses(String(formData.get("importStatuses") || ""));
+    if (importStatuses.length === 0) {
+      return NextResponse.json({ error: "importStatuses 不能为空" }, { status: 400 });
     }
 
     const providerScopeRaw = String(formData.get("providerScope") || "all").toLowerCase();
@@ -65,24 +59,22 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       }))
     );
 
-    const { zipBuffer, deletedPaths } = await cleanupArchiveCredentials(
+    const result = await importCredentialsToGithubRepo(
       archives,
-      deleteStatuses,
       resultRefs,
-      providerScope
+      importStatuses,
+      providerScope,
+      {
+        repoUrl: String(formData.get("repoUrl") || ""),
+        githubToken: String(formData.get("githubToken") || ""),
+        branch: String(formData.get("branch") || "master"),
+        authSubdir: String(formData.get("authSubdir") || "auths")
+      }
     );
 
-    return new NextResponse(new Uint8Array(zipBuffer), {
-      status: 200,
-      headers: {
-        "Content-Type": "application/zip",
-        "Content-Disposition": `attachment; filename="auths.cleaned.bundle.${Date.now()}.zip"`,
-        "X-Deleted-Count": String(deletedPaths.length),
-        "X-Deleted-Preview": deletedPaths.slice(0, 20).join(",")
-      }
-    });
+    return NextResponse.json(result, { status: 200 });
   } catch (error) {
-    const message = error instanceof Error ? error.message : "清理失败";
+    const message = error instanceof Error ? error.message : "导入失败";
     return NextResponse.json({ error: message }, { status: 500 });
   }
 }

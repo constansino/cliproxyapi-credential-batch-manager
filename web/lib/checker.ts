@@ -1,11 +1,16 @@
 import JSZip from "jszip";
 import {
+  ArchiveInput,
   CheckOptions,
+  CheckOrigin,
   CheckReport,
   CheckResult,
   CheckSummary,
   CleanupResultRef,
-  ProviderScope
+  ProviderScope,
+  RepoConfig,
+  RepoDeleteResult,
+  RepoImportResult
 } from "@/lib/types";
 
 interface HttpResponse {
@@ -13,11 +18,34 @@ interface HttpResponse {
   responseText: string;
 }
 
+interface CredentialInput {
+  origin: CheckOrigin;
+  source: string;
+  path: string;
+  rawText: string;
+}
+
+interface RepoFileEntry {
+  path: string;
+  name: string;
+  sha: string;
+}
+
+interface NormalizedRepoConfig {
+  repoUrl: string;
+  githubToken: string;
+  branch: string;
+  authSubdir: string;
+  owner: string;
+  repo: string;
+}
+
 type JsonValue = Record<string, unknown>;
 
 const DEFAULT_TIMEOUT_SECONDS = 35;
 const DEFAULT_WORKERS = 120;
 const MAX_DETAIL_BYTES = 512;
+const GITHUB_TIMEOUT_MS = 45_000;
 
 export function normalizeOptions(input: Partial<CheckOptions>): CheckOptions {
   const codexModel = String(input.codexModel || "gpt-5").trim() || "gpt-5";
@@ -513,27 +541,63 @@ async function mapWithConcurrency<T, R>(
   return result;
 }
 
-async function checkJsonFile(
-  filePath: string,
-  rawText: string,
+function normalizeArchiveInputs(archives: ArchiveInput[]): ArchiveInput[] {
+  const nameCounter = new Map<string, number>();
+  return archives.map((archive) => {
+    const original = (archive.name || "").trim() || "auths.zip";
+    const count = nameCounter.get(original) || 0;
+    nameCounter.set(original, count + 1);
+    if (count === 0) {
+      return { ...archive, name: original };
+    }
+    const extIndex = original.lastIndexOf(".");
+    const base = extIndex > 0 ? original.slice(0, extIndex) : original;
+    const ext = extIndex > 0 ? original.slice(extIndex) : "";
+    return { ...archive, name: `${base}(${count + 1})${ext}` };
+  });
+}
+
+async function collectArchiveCredentials(archivesInput: ArchiveInput[]): Promise<CredentialInput[]> {
+  const archives = normalizeArchiveInputs(archivesInput);
+  const items: CredentialInput[] = [];
+  for (const archive of archives) {
+    const zip = await JSZip.loadAsync(Buffer.from(archive.arrayBuffer));
+    const jsonFiles = Object.values(zip.files).filter((entry) => !entry.dir && entry.name.toLowerCase().endsWith(".json"));
+    for (const entry of jsonFiles) {
+      items.push({
+        origin: "upload",
+        source: archive.name,
+        path: entry.name,
+        rawText: await entry.async("string")
+      });
+    }
+  }
+  return items;
+}
+
+async function checkCredential(
+  input: CredentialInput,
   options: CheckOptions
 ): Promise<CheckResult> {
   const begin = Date.now();
   const nowUtc = new Date();
   const checkedAt = utcNowText(nowUtc);
-  const filename = filePath.split("/").at(-1) || filePath;
+  const filename = input.path.split("/").at(-1) || input.path;
 
   let metadata: JsonValue;
   try {
-    const parsed = JSON.parse(rawText);
+    const parsed = JSON.parse(input.rawText);
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
       throw new Error("json root is not an object");
     }
     metadata = parsed as JsonValue;
   } catch (error) {
     return {
+      id: `${input.origin}:${input.source}:${input.path}`,
+      source: input.source,
+      origin: input.origin,
       file: filename,
-      path: filePath,
+      path: input.path,
       provider: "unknown",
       email: "",
       status: "check_error",
@@ -598,8 +662,11 @@ async function checkJsonFile(
   }
 
   return {
+    id: `${input.origin}:${input.source}:${input.path}`,
+    source: input.source,
+    origin: input.origin,
     file: filename,
-    path: filePath,
+    path: input.path,
     provider,
     email,
     status,
@@ -613,26 +680,35 @@ async function checkJsonFile(
   };
 }
 
-export async function checkArchiveCredentials(arrayBuffer: ArrayBuffer, inputOptions: Partial<CheckOptions>): Promise<CheckReport> {
-  const options = normalizeOptions(inputOptions);
-  const started = Date.now();
-  const zip = await JSZip.loadAsync(Buffer.from(arrayBuffer));
-  const jsonFiles = Object.values(zip.files).filter((entry) => !entry.dir && entry.name.toLowerCase().endsWith(".json"));
-
-  if (jsonFiles.length === 0) {
-    throw new Error("zip 内没有找到任何 .json 凭证文件");
+async function checkCredentials(
+  credentials: CredentialInput[],
+  inputOptions: Partial<CheckOptions>,
+  mode: "upload" | "repo",
+  sourceLabel: string
+): Promise<CheckReport> {
+  if (credentials.length === 0) {
+    throw new Error(mode === "upload" ? "上传的 zip 中没有找到 .json 凭证文件" : "仓库 auth 目录下没有 .json 凭证文件");
   }
 
-  const rawResults = await mapWithConcurrency(jsonFiles, options.workers, async (entry) => {
-    const text = await entry.async("string");
-    return checkJsonFile(entry.name, text, options);
+  const options = normalizeOptions(inputOptions);
+  const started = Date.now();
+
+  const rawResults = await mapWithConcurrency(credentials, options.workers, (item) => checkCredential(item, options));
+  const results = [...rawResults].sort((a, b) => {
+    if (a.source !== b.source) {
+      return a.source.localeCompare(b.source);
+    }
+    if (a.file !== b.file) {
+      return a.file.localeCompare(b.file);
+    }
+    return a.path.localeCompare(b.path);
   });
-  const results = [...rawResults].sort((a, b) => a.file.localeCompare(b.file));
 
   return {
     checked_at_utc: utcNowText(),
     duration_seconds: Number(((Date.now() - started) / 1000).toFixed(3)),
-    mode: "upload",
+    mode,
+    source_label: sourceLabel,
     codex_model: options.codexModel,
     codex_usage_limit_only: options.codexUsageLimitOnly,
     total: results.length,
@@ -641,52 +717,443 @@ export async function checkArchiveCredentials(arrayBuffer: ArrayBuffer, inputOpt
   };
 }
 
+function parseGithubRepoUrl(repoUrl: string): { owner: string; repo: string } {
+  const text = (repoUrl || "").trim();
+  if (!text) {
+    throw new Error("repoUrl 不能为空");
+  }
+
+  if (text.startsWith("git@github.com:")) {
+    const suffix = text.slice("git@github.com:".length).replace(/\.git$/i, "");
+    const [owner, repo] = suffix.split("/");
+    if (owner && repo) {
+      return { owner, repo };
+    }
+  }
+
+  const parsed = new URL(text);
+  if (parsed.hostname !== "github.com") {
+    throw new Error("repoUrl 必须是 github.com 仓库地址");
+  }
+  const parts = parsed.pathname.replace(/^\/+|\/+$/g, "").split("/");
+  if (parts.length < 2) {
+    throw new Error("repoUrl 格式无效，示例: https://github.com/owner/repo");
+  }
+  return {
+    owner: parts[0],
+    repo: parts[1].replace(/\.git$/i, "")
+  };
+}
+
+function normalizeRepoConfig(input: Partial<RepoConfig>): NormalizedRepoConfig {
+  const repoUrl = (input.repoUrl || "").trim();
+  const githubToken = (input.githubToken || "").trim();
+  const branch = (input.branch || "master").trim() || "master";
+  const authSubdir = (input.authSubdir || "auths").trim().replace(/^\/+|\/+$/g, "");
+  if (!repoUrl) {
+    throw new Error("repoUrl 不能为空");
+  }
+  if (!githubToken) {
+    throw new Error("githubToken 不能为空");
+  }
+  const { owner, repo } = parseGithubRepoUrl(repoUrl);
+  return { repoUrl, githubToken, branch, authSubdir, owner, repo };
+}
+
+function encodeRepoPath(path: string): string {
+  return path
+    .split("/")
+    .filter(Boolean)
+    .map((segment) => encodeURIComponent(segment))
+    .join("/");
+}
+
+function buildRepoContentsUrl(config: NormalizedRepoConfig, path: string): string {
+  const base = `https://api.github.com/repos/${encodeURIComponent(config.owner)}/${encodeURIComponent(config.repo)}/contents`;
+  const suffix = path ? `/${encodeRepoPath(path)}` : "";
+  return `${base}${suffix}?ref=${encodeURIComponent(config.branch)}`;
+}
+
+function asObject(value: unknown): Record<string, unknown> | null {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  return null;
+}
+
+async function githubRequest(
+  config: NormalizedRepoConfig,
+  url: string,
+  method: "GET" | "PUT" | "DELETE" = "GET",
+  body?: Record<string, unknown>
+): Promise<unknown> {
+  const response = await fetch(url, {
+    method,
+    headers: {
+      Authorization: `Bearer ${config.githubToken}`,
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+      "Content-Type": "application/json"
+    },
+    body: body ? JSON.stringify(body) : undefined,
+    signal: AbortSignal.timeout(GITHUB_TIMEOUT_MS)
+  });
+
+  const text = await response.text();
+  let payload: unknown = {};
+  try {
+    payload = text ? JSON.parse(text) : {};
+  } catch {
+    payload = { raw: shortText(text, 800) };
+  }
+
+  if (!response.ok) {
+    const errorText =
+      payload && typeof payload === "object" && !Array.isArray(payload)
+        ? String((payload as Record<string, unknown>).message || text || "unknown error")
+        : String(text || "unknown error");
+    throw new Error(`GitHub API ${response.status}: ${shortText(errorText, 500)}`);
+  }
+  return payload;
+}
+
+function toFileEntry(value: unknown): RepoFileEntry | null {
+  const obj = asObject(value);
+  if (!obj) {
+    return null;
+  }
+  const type = String(obj.type || "");
+  const path = String(obj.path || "");
+  const name = String(obj.name || "");
+  const sha = String(obj.sha || "");
+  if (type !== "file" || !path || !name || !sha) {
+    return null;
+  }
+  return { path, name, sha };
+}
+
+async function listRepoJsonFiles(config: NormalizedRepoConfig): Promise<RepoFileEntry[]> {
+  const queue: string[] = [config.authSubdir];
+  const seenDirs = new Set<string>();
+  const files: RepoFileEntry[] = [];
+
+  while (queue.length > 0) {
+    const current = queue.shift() || "";
+    if (seenDirs.has(current)) {
+      continue;
+    }
+    seenDirs.add(current);
+
+    const payload = await githubRequest(config, buildRepoContentsUrl(config, current), "GET");
+    const items = Array.isArray(payload) ? payload : [payload];
+    for (const item of items) {
+      const obj = asObject(item);
+      if (!obj) {
+        continue;
+      }
+      const itemType = String(obj.type || "");
+      const itemPath = String(obj.path || "");
+      const itemName = String(obj.name || "");
+      if (!itemType || !itemPath) {
+        continue;
+      }
+      if (itemType === "dir") {
+        queue.push(itemPath);
+        continue;
+      }
+      if (itemType !== "file" || !itemName.toLowerCase().endsWith(".json")) {
+        continue;
+      }
+      const file = toFileEntry(item);
+      if (file) {
+        files.push(file);
+      }
+    }
+  }
+  return files.sort((a, b) => a.path.localeCompare(b.path));
+}
+
+async function readRepoFileText(config: NormalizedRepoConfig, path: string): Promise<{ text: string; sha: string }> {
+  const payload = await githubRequest(config, buildRepoContentsUrl(config, path), "GET");
+  const obj = asObject(payload);
+  if (!obj || String(obj.type || "") !== "file") {
+    throw new Error(`仓库文件读取失败: ${path}`);
+  }
+  const content = String(obj.content || "").replace(/\n/g, "");
+  const encoding = String(obj.encoding || "");
+  const sha = String(obj.sha || "");
+  if (!content || encoding !== "base64") {
+    throw new Error(`仓库文件编码异常: ${path}`);
+  }
+  return {
+    text: Buffer.from(content, "base64").toString("utf8"),
+    sha
+  };
+}
+
+function joinRepoPath(subdir: string, filename: string): string {
+  const safeSubdir = subdir.replace(/^\/+|\/+$/g, "");
+  if (!safeSubdir) {
+    return filename;
+  }
+  return `${safeSubdir}/${filename}`;
+}
+
+function chooseUniqueTargetPath(authSubdir: string, filename: string, existingPaths: Set<string>): string {
+  const cleaned = filename.replace(/[\\/:*?"<>|]+/g, "_") || "credential.json";
+  const dot = cleaned.lastIndexOf(".");
+  const base = dot > 0 ? cleaned.slice(0, dot) : cleaned;
+  const ext = dot > 0 ? cleaned.slice(dot) : ".json";
+  let counter = 0;
+  while (true) {
+    const suffix = counter === 0 ? "" : `-${counter}`;
+    const candidate = joinRepoPath(authSubdir, `${base}${suffix}${ext}`);
+    if (!existingPaths.has(candidate)) {
+      return candidate;
+    }
+    counter += 1;
+  }
+}
+
+function parseStatusSet(statuses: string[]): Set<string> {
+  return new Set(
+    statuses
+      .map((item) => item.trim().toLowerCase())
+      .filter(Boolean)
+  );
+}
+
+function shouldApplyByProvider(provider: string, scope: ProviderScope): boolean {
+  if (scope === "all") {
+    return true;
+  }
+  return provider.trim().toLowerCase() === "codex";
+}
+
+function pickMatchingRefs(
+  refs: CleanupResultRef[],
+  statusSet: Set<string>,
+  providerScope: ProviderScope,
+  origin: CheckOrigin
+): CleanupResultRef[] {
+  const selected: CleanupResultRef[] = [];
+  const seen = new Set<string>();
+  for (const ref of refs) {
+    const refOrigin = (ref.origin || "").trim().toLowerCase();
+    if (refOrigin !== origin) {
+      continue;
+    }
+    const status = String(ref.status || "").trim().toLowerCase();
+    const provider = String(ref.provider || "").trim().toLowerCase();
+    const source = String(ref.source || "").trim();
+    const path = String(ref.path || "").trim();
+    if (!source || !path || !statusSet.has(status) || !shouldApplyByProvider(provider, providerScope)) {
+      continue;
+    }
+    const key = `${source}:${path}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    selected.push({ source, origin, path, status, provider });
+  }
+  return selected;
+}
+
+export async function checkArchiveCredentials(
+  archivesInput: ArchiveInput[],
+  inputOptions: Partial<CheckOptions>
+): Promise<CheckReport> {
+  const credentials = await collectArchiveCredentials(archivesInput);
+  return checkCredentials(credentials, inputOptions, "upload", `upload:${archivesInput.length} archive(s)`);
+}
+
+export async function checkGithubRepoCredentials(
+  repoInput: Partial<RepoConfig>,
+  inputOptions: Partial<CheckOptions>
+): Promise<CheckReport> {
+  const config = normalizeRepoConfig(repoInput);
+  const entries = await listRepoJsonFiles(config);
+  if (entries.length === 0) {
+    throw new Error(`仓库 ${config.owner}/${config.repo} 的 ${config.authSubdir} 下未找到 .json 凭证`);
+  }
+
+  const options = normalizeOptions(inputOptions);
+  const credentials = await mapWithConcurrency(entries, Math.min(options.workers, 24), async (entry) => {
+    const file = await readRepoFileText(config, entry.path);
+    return {
+      origin: "repo" as const,
+      source: `repo:${config.owner}/${config.repo}@${config.branch}`,
+      path: entry.path,
+      rawText: file.text
+    };
+  });
+
+  return checkCredentials(
+    credentials,
+    options,
+    "repo",
+    `repo:${config.owner}/${config.repo}@${config.branch}/${config.authSubdir}`
+  );
+}
+
 export async function cleanupArchiveCredentials(
-  arrayBuffer: ArrayBuffer,
+  archivesInput: ArchiveInput[],
   deleteStatuses: string[],
   resultRefs: CleanupResultRef[],
   providerScope: ProviderScope
 ): Promise<{ zipBuffer: Buffer; deletedPaths: string[] }> {
-  const normalizedDeleteSet = new Set(
-    deleteStatuses
-      .map((status) => status.trim())
-      .filter(Boolean)
-      .map((status) => status.toLowerCase())
-  );
+  const archives = normalizeArchiveInputs(archivesInput);
+  if (archives.length === 0) {
+    throw new Error("缺少上传 zip");
+  }
+  const statusSet = parseStatusSet(deleteStatuses);
+  if (statusSet.size === 0) {
+    throw new Error("deleteStatuses 不能为空");
+  }
+  const targets = pickMatchingRefs(resultRefs, statusSet, providerScope, "upload");
 
-  const refMap = new Map<string, CleanupResultRef>();
-  for (const ref of resultRefs) {
-    const normalizedPath = String(ref.path || "").trim();
-    if (!normalizedPath) {
-      continue;
+  const refMap = new Map<string, Set<string>>();
+  for (const ref of targets) {
+    if (!refMap.has(ref.source)) {
+      refMap.set(ref.source, new Set<string>());
     }
-    refMap.set(normalizedPath, {
-      path: normalizedPath,
-      status: String(ref.status || "").trim().toLowerCase(),
-      provider: String(ref.provider || "").trim().toLowerCase()
-    });
+    refMap.get(ref.source)!.add(ref.path);
   }
 
-  const zip = await JSZip.loadAsync(Buffer.from(arrayBuffer));
   const deletedPaths: string[] = [];
+  const cleanedArchiveBuffers: Array<{ name: string; buffer: Buffer }> = [];
 
-  for (const [path, ref] of refMap.entries()) {
-    if (!normalizedDeleteSet.has(ref.status)) {
-      continue;
+  for (const archive of archives) {
+    const zip = await JSZip.loadAsync(Buffer.from(archive.arrayBuffer));
+    const archiveTargets = refMap.get(archive.name) || new Set<string>();
+    for (const path of archiveTargets) {
+      if (zip.file(path)) {
+        zip.remove(path);
+        deletedPaths.push(`${archive.name}:${path}`);
+      }
     }
-    if (providerScope === "codex" && ref.provider !== "codex") {
-      continue;
-    }
-    if (zip.file(path)) {
-      zip.remove(path);
-      deletedPaths.push(path);
-    }
+    const cleanedBuffer = await zip.generateAsync({
+      type: "nodebuffer",
+      compression: "DEFLATE",
+      compressionOptions: { level: 6 }
+    });
+    cleanedArchiveBuffers.push({ name: archive.name, buffer: cleanedBuffer });
   }
 
-  const zipBuffer = await zip.generateAsync({
+  if (cleanedArchiveBuffers.length === 1) {
+    return {
+      zipBuffer: cleanedArchiveBuffers[0].buffer,
+      deletedPaths: deletedPaths.sort((a, b) => a.localeCompare(b))
+    };
+  }
+
+  const bundle = new JSZip();
+  for (const archive of cleanedArchiveBuffers) {
+    bundle.file(archive.name, archive.buffer);
+  }
+  const bundleBuffer = await bundle.generateAsync({
     type: "nodebuffer",
     compression: "DEFLATE",
     compressionOptions: { level: 6 }
   });
-  return { zipBuffer, deletedPaths: deletedPaths.sort((a, b) => a.localeCompare(b)) };
+  return { zipBuffer: bundleBuffer, deletedPaths: deletedPaths.sort((a, b) => a.localeCompare(b)) };
+}
+
+export async function importCredentialsToGithubRepo(
+  archivesInput: ArchiveInput[],
+  resultRefs: CleanupResultRef[],
+  importStatuses: string[],
+  providerScope: ProviderScope,
+  repoInput: Partial<RepoConfig>
+): Promise<RepoImportResult> {
+  const config = normalizeRepoConfig(repoInput);
+  const archives = normalizeArchiveInputs(archivesInput);
+  const statusSet = parseStatusSet(importStatuses);
+  if (statusSet.size === 0) {
+    throw new Error("importStatuses 不能为空");
+  }
+  const targets = pickMatchingRefs(resultRefs, statusSet, providerScope, "upload");
+  if (targets.length === 0) {
+    return { imported_paths: [], skipped_paths: [] };
+  }
+
+  const archiveMap = new Map<string, JSZip>();
+  for (const archive of archives) {
+    archiveMap.set(archive.name, await JSZip.loadAsync(Buffer.from(archive.arrayBuffer)));
+  }
+
+  const existingPaths = new Set((await listRepoJsonFiles(config)).map((item) => item.path));
+  const importedPaths: string[] = [];
+  const skippedPaths: string[] = [];
+
+  for (const ref of targets) {
+    const zip = archiveMap.get(ref.source);
+    if (!zip) {
+      skippedPaths.push(`${ref.source}:${ref.path}`);
+      continue;
+    }
+    const file = zip.file(ref.path);
+    if (!file) {
+      skippedPaths.push(`${ref.source}:${ref.path}`);
+      continue;
+    }
+    const fileContent = await file.async("string");
+    const filename = ref.path.split("/").at(-1) || "credential.json";
+    const targetPath = chooseUniqueTargetPath(config.authSubdir, filename, existingPaths);
+    const putUrl = `https://api.github.com/repos/${encodeURIComponent(config.owner)}/${encodeURIComponent(config.repo)}/contents/${encodeRepoPath(targetPath)}`;
+
+    await githubRequest(config, putUrl, "PUT", {
+      message: `import credential from 2apicheck (${ref.source}:${ref.path})`,
+      content: Buffer.from(fileContent, "utf8").toString("base64"),
+      branch: config.branch
+    });
+    existingPaths.add(targetPath);
+    importedPaths.push(targetPath);
+  }
+
+  return {
+    imported_paths: importedPaths.sort((a, b) => a.localeCompare(b)),
+    skipped_paths: skippedPaths.sort((a, b) => a.localeCompare(b))
+  };
+}
+
+export async function deleteCredentialsFromGithubRepo(
+  resultRefs: CleanupResultRef[],
+  deleteStatuses: string[],
+  providerScope: ProviderScope,
+  repoInput: Partial<RepoConfig>
+): Promise<RepoDeleteResult> {
+  const config = normalizeRepoConfig(repoInput);
+  const statusSet = parseStatusSet(deleteStatuses);
+  if (statusSet.size === 0) {
+    throw new Error("deleteStatuses 不能为空");
+  }
+  const targets = pickMatchingRefs(resultRefs, statusSet, providerScope, "repo");
+  if (targets.length === 0) {
+    return { deleted_paths: [], failed_paths: [] };
+  }
+
+  const deletedPaths: string[] = [];
+  const failedPaths: string[] = [];
+
+  for (const target of targets) {
+    try {
+      const file = await readRepoFileText(config, target.path);
+      const deleteUrl = `https://api.github.com/repos/${encodeURIComponent(config.owner)}/${encodeURIComponent(config.repo)}/contents/${encodeRepoPath(target.path)}`;
+      await githubRequest(config, deleteUrl, "DELETE", {
+        message: `delete credential by 2apicheck status=${target.status}`,
+        sha: file.sha,
+        branch: config.branch
+      });
+      deletedPaths.push(target.path);
+    } catch {
+      failedPaths.push(target.path);
+    }
+  }
+
+  return {
+    deleted_paths: deletedPaths.sort((a, b) => a.localeCompare(b)),
+    failed_paths: failedPaths.sort((a, b) => a.localeCompare(b))
+  };
 }
