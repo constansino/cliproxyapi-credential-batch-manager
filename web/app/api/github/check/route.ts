@@ -19,7 +19,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
         codexModel: String(payload.codexModel || "gpt-5"),
         codexUsageLimitOnly: Boolean(payload.codexUsageLimitOnly),
         timeoutSeconds: Number(payload.timeoutSeconds || 35),
-        workers: Number(payload.workers || 120)
+        workers: Number(payload.workers || 200)
       })
     );
 

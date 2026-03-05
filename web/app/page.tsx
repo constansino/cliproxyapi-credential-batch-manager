@@ -45,7 +45,7 @@ export default function HomePage(): React.ReactElement {
   const [archives, setArchives] = useState<File[]>([]);
   const [codexModel, setCodexModel] = useState("gpt-5");
   const [timeoutSeconds, setTimeoutSeconds] = useState(35);
-  const [workers, setWorkers] = useState(120);
+  const [workers, setWorkers] = useState(200);
   const [codexUsageLimitOnly, setCodexUsageLimitOnly] = useState(false);
 
   const [repoUrl, setRepoUrl] = useState("https://github.com/your-org/your-auth-repo");
@@ -507,10 +507,11 @@ export default function HomePage(): React.ReactElement {
             <input
               type="number"
               min={1}
-              max={300}
+              max={500}
               value={workers}
-              onChange={(event) => setWorkers(Number(event.target.value || 120))}
+              onChange={(event) => setWorkers(Number(event.target.value || 200))}
             />
+            <small className="field-hint">默认 200（Vercel 免费版建议区间 120-260，可按网络情况调高/调低）。</small>
           </label>
 
           <label className="field toggle">

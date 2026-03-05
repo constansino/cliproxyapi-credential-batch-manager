@@ -26,7 +26,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       codexModel: String(formData.get("codexModel") || "gpt-5"),
       codexUsageLimitOnly: String(formData.get("codexUsageLimitOnly") || "").toLowerCase() === "true",
       timeoutSeconds: Number(formData.get("timeoutSeconds") || 35),
-      workers: Number(formData.get("workers") || 120)
+      workers: Number(formData.get("workers") || 200)
     });
 
     const archives: ArchiveInput[] = await Promise.all(

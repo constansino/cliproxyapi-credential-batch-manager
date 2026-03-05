@@ -43,14 +43,14 @@ interface NormalizedRepoConfig {
 type JsonValue = Record<string, unknown>;
 
 const DEFAULT_TIMEOUT_SECONDS = 35;
-const DEFAULT_WORKERS = 120;
+const DEFAULT_WORKERS = 200;
 const MAX_DETAIL_BYTES = 512;
 const GITHUB_TIMEOUT_MS = 45_000;
 
 export function normalizeOptions(input: Partial<CheckOptions>): CheckOptions {
   const codexModel = String(input.codexModel || "gpt-5").trim() || "gpt-5";
   const timeoutSeconds = clampInt(input.timeoutSeconds, 5, 120, DEFAULT_TIMEOUT_SECONDS);
-  const workers = clampInt(input.workers, 1, 300, DEFAULT_WORKERS);
+  const workers = clampInt(input.workers, 1, 500, DEFAULT_WORKERS);
   return {
     codexModel,
     codexUsageLimitOnly: Boolean(input.codexUsageLimitOnly),
