@@ -48,7 +48,7 @@ export default function HomePage(): React.ReactElement {
   const [workers, setWorkers] = useState(120);
   const [codexUsageLimitOnly, setCodexUsageLimitOnly] = useState(false);
 
-  const [repoUrl, setRepoUrl] = useState("https://github.com/constansino/conscliproxyapi");
+  const [repoUrl, setRepoUrl] = useState("https://github.com/your-org/your-auth-repo");
   const [repoBranch, setRepoBranch] = useState("master");
   const [repoAuthSubdir, setRepoAuthSubdir] = useState("auths");
   const [githubToken, setGithubToken] = useState("");
@@ -65,13 +65,81 @@ export default function HomePage(): React.ReactElement {
   const [providerScope, setProviderScope] = useState<ProviderScope>("codex");
   const [deleteStatuses, setDeleteStatuses] = useState<string[]>([]);
   const [importStatuses, setImportStatuses] = useState<string[]>([]);
+  const [providerFilter, setProviderFilter] = useState("all");
+  const [statusFilter, setStatusFilter] = useState("all");
+  const [httpFilter, setHttpFilter] = useState("all");
+  const [reasonFilter, setReasonFilter] = useState("all");
+  const [reasonKeyword, setReasonKeyword] = useState("");
+  const [checkProgress, setCheckProgress] = useState(0);
+  const [checkProgressLabel, setCheckProgressLabel] = useState("");
 
   const statusKeys = useMemo(() => Object.keys(report?.summary.by_status || {}), [report]);
+  const isChecking = isCheckingUpload || isCheckingRepo;
+
+  const providerOptions = useMemo(() => {
+    if (!report) {
+      return [];
+    }
+    return Array.from(new Set(report.results.map((item) => item.provider).filter(Boolean))).sort((a, b) =>
+      a.localeCompare(b)
+    );
+  }, [report]);
+
+  const httpOptions = useMemo(() => {
+    if (!report) {
+      return [];
+    }
+    return Array.from(
+      new Set(report.results.map((item) => (item.http_status === null ? "-" : String(item.http_status))))
+    ).sort((a, b) => a.localeCompare(b));
+  }, [report]);
+
+  const reasonOptions = useMemo(() => {
+    if (!report) {
+      return [];
+    }
+    return Array.from(new Set(report.results.map((item) => item.reason).filter(Boolean))).sort((a, b) =>
+      a.localeCompare(b)
+    );
+  }, [report]);
+
+  const filteredAllResults = useMemo(() => {
+    if (!report) {
+      return [];
+    }
+    const reasonKeywordLower = reasonKeyword.trim().toLowerCase();
+    return report.results.filter((item) => {
+      if (providerFilter !== "all" && item.provider !== providerFilter) {
+        return false;
+      }
+      if (statusFilter !== "all" && item.status !== statusFilter) {
+        return false;
+      }
+      const httpText = item.http_status === null ? "-" : String(item.http_status);
+      if (httpFilter !== "all" && httpText !== httpFilter) {
+        return false;
+      }
+      if (reasonFilter !== "all" && item.reason !== reasonFilter) {
+        return false;
+      }
+      if (reasonKeywordLower && !item.reason.toLowerCase().includes(reasonKeywordLower)) {
+        return false;
+      }
+      return true;
+    });
+  }, [report, providerFilter, statusFilter, httpFilter, reasonFilter, reasonKeyword]);
+
+  const filteredRows = useMemo(() => filteredAllResults.slice(0, TABLE_LIMIT), [filteredAllResults]);
 
   useEffect(() => {
     if (!report) {
       setDeleteStatuses([]);
       setImportStatuses([]);
+      setProviderFilter("all");
+      setStatusFilter("all");
+      setHttpFilter("all");
+      setReasonFilter("all");
+      setReasonKeyword("");
       return;
     }
     setDeleteStatuses(DEFAULT_DELETE_STATUSES.filter((status) => statusKeys.includes(status)));
@@ -83,7 +151,38 @@ export default function HomePage(): React.ReactElement {
     } else {
       setImportStatuses([]);
     }
+    setProviderFilter("all");
+    setStatusFilter("all");
+    setHttpFilter("all");
+    setReasonFilter("all");
+    setReasonKeyword("");
   }, [report, statusKeys]);
+
+  useEffect(() => {
+    if (!isChecking) {
+      return;
+    }
+    setCheckProgress((prev) => Math.max(prev, 4));
+    const timer = window.setInterval(() => {
+      setCheckProgress((prev) => {
+        if (prev >= 92) {
+          return prev;
+        }
+        const step = Math.max(1, Math.floor((92 - prev) / 8));
+        return Math.min(92, prev + step);
+      });
+    }, 450);
+    return () => window.clearInterval(timer);
+  }, [isChecking]);
+
+  useEffect(() => {
+    if (isChecking || checkProgress <= 0) {
+      return;
+    }
+    setCheckProgress(100);
+    const timer = window.setTimeout(() => setCheckProgress(0), 600);
+    return () => window.clearTimeout(timer);
+  }, [isChecking, checkProgress]);
 
   function pickUnavailableCodexStatuses(): void {
     if (!report) {
@@ -124,6 +223,14 @@ export default function HomePage(): React.ReactElement {
     }
   }
 
+  function resetDetailFilters(): void {
+    setProviderFilter("all");
+    setStatusFilter("all");
+    setHttpFilter("all");
+    setReasonFilter("all");
+    setReasonKeyword("");
+  }
+
   async function submitUploadCheck(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault();
     setError("");
@@ -133,6 +240,8 @@ export default function HomePage(): React.ReactElement {
       return;
     }
 
+    setCheckProgressLabel("正在检查上传凭证包...");
+    setCheckProgress(4);
     setIsCheckingUpload(true);
     try {
       const form = new FormData();
@@ -166,6 +275,8 @@ export default function HomePage(): React.ReactElement {
   async function submitRepoCheck(): Promise<void> {
     setError("");
     setNotice("");
+    setCheckProgressLabel("正在检查仓库凭证...");
+    setCheckProgress(4);
     setIsCheckingRepo(true);
     try {
       ensureRepoConfig();
@@ -350,6 +461,12 @@ export default function HomePage(): React.ReactElement {
         <p className="hero-label">2ApiCheck</p>
         <h1>多包检查 + GitHub 仓库管理</h1>
         <p>支持多 ZIP 上传检查、可用凭证一键导入仓库、仓库现有凭证状态检查与批量删除。</p>
+        <p className="feedback-tip">
+          有问题可反馈：
+          <a href="https://aiya.de5.net/c/26-category/26" target="_blank" rel="noreferrer">
+            https://aiya.de5.net/c/26-category/26
+          </a>
+        </p>
       </section>
 
       <section className="panel">
@@ -371,6 +488,7 @@ export default function HomePage(): React.ReactElement {
           <label className="field">
             <span>Codex 模型</span>
             <input value={codexModel} onChange={(event) => setCodexModel(event.target.value)} placeholder="gpt-5" />
+            <small className="field-hint">默认 `gpt-5`，用于 Codex 凭证测活探针（检查可用性）。</small>
           </label>
 
           <label className="field">
@@ -419,7 +537,7 @@ export default function HomePage(): React.ReactElement {
         <div className="form-grid">
           <label className="field">
             <span>Repo URL</span>
-            <input value={repoUrl} onChange={(event) => setRepoUrl(event.target.value)} placeholder="https://github.com/owner/repo" />
+            <input value={repoUrl} onChange={(event) => setRepoUrl(event.target.value)} placeholder="https://github.com/your-org/your-auth-repo" />
           </label>
           <label className="field">
             <span>Branch</span>
@@ -438,6 +556,18 @@ export default function HomePage(): React.ReactElement {
           </button>
         </div>
       </section>
+
+      {checkProgress > 0 ? (
+        <section className="panel progress-panel">
+          <div className="progress-head">
+            <strong>{checkProgressLabel || "检查中..."}</strong>
+            <span>{Math.round(checkProgress)}%</span>
+          </div>
+          <div className="progress-track">
+            <div className="progress-fill" style={{ width: `${checkProgress}%` }} />
+          </div>
+        </section>
+      ) : null}
 
       {error ? <p className="error-text">{error}</p> : null}
       {notice ? <p className="ok-text">{notice}</p> : null}
@@ -538,7 +668,66 @@ export default function HomePage(): React.ReactElement {
           </section>
 
           <section className="panel">
-            <h2>明细（前 {TABLE_LIMIT} 条）</h2>
+            <h2>明细筛选</h2>
+            <div className="filter-grid">
+              <label className="field">
+                <span>provider</span>
+                <select value={providerFilter} onChange={(event) => setProviderFilter(event.target.value)}>
+                  <option value="all">全部</option>
+                  {providerOptions.map((provider) => (
+                    <option key={provider} value={provider}>
+                      {provider}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="field">
+                <span>status</span>
+                <select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}>
+                  <option value="all">全部</option>
+                  {statusKeys.map((status) => (
+                    <option key={status} value={status}>
+                      {status}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="field">
+                <span>http</span>
+                <select value={httpFilter} onChange={(event) => setHttpFilter(event.target.value)}>
+                  <option value="all">全部</option>
+                  {httpOptions.map((httpValue) => (
+                    <option key={httpValue} value={httpValue}>
+                      {httpValue}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="field">
+                <span>reason 精确</span>
+                <select value={reasonFilter} onChange={(event) => setReasonFilter(event.target.value)}>
+                  <option value="all">全部</option>
+                  {reasonOptions.map((reason) => (
+                    <option key={reason} value={reason}>
+                      {reason}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="field">
+                <span>reason 关键词</span>
+                <input value={reasonKeyword} onChange={(event) => setReasonKeyword(event.target.value)} placeholder="输入关键词筛选" />
+              </label>
+              <button className="btn" type="button" onClick={resetDetailFilters}>
+                清空筛选
+              </button>
+            </div>
+
+            <p className="file-info">
+              筛选后 {filteredAllResults.length} 条，展示前 {TABLE_LIMIT} 条。
+            </p>
+
+            <h2>明细（筛选后）</h2>
             <div className="table-wrap">
               <table>
                 <thead>
@@ -552,18 +741,24 @@ export default function HomePage(): React.ReactElement {
                   </tr>
                 </thead>
                 <tbody>
-                  {report.results.slice(0, TABLE_LIMIT).map((item) => (
-                    <tr key={item.id}>
-                      <td title={item.path}>{item.source}</td>
-                      <td title={item.path}>{item.file}</td>
-                      <td>{item.provider}</td>
-                      <td>
-                        <span className={classForStatus(item.status)}>{item.status}</span>
-                      </td>
-                      <td>{item.http_status ?? "-"}</td>
-                      <td title={item.detail || item.reason}>{item.reason}</td>
+                  {filteredRows.length > 0 ? (
+                    filteredRows.map((item) => (
+                      <tr key={item.id}>
+                        <td title={item.path}>{item.source}</td>
+                        <td title={item.path}>{item.file}</td>
+                        <td>{item.provider}</td>
+                        <td>
+                          <span className={classForStatus(item.status)}>{item.status}</span>
+                        </td>
+                        <td>{item.http_status ?? "-"}</td>
+                        <td title={item.detail || item.reason}>{item.reason}</td>
+                      </tr>
+                    ))
+                  ) : (
+                    <tr>
+                      <td colSpan={6}>当前筛选条件下无数据。</td>
                     </tr>
-                  ))}
+                  )}
                 </tbody>
               </table>
             </div>
