@@ -774,12 +774,6 @@ function encodeRepoPath(path: string): string {
     .join("/");
 }
 
-function buildRepoContentsUrl(config: NormalizedRepoConfig, path: string): string {
-  const base = `https://api.github.com/repos/${encodeURIComponent(config.owner)}/${encodeURIComponent(config.repo)}/contents`;
-  const suffix = path ? `/${encodeRepoPath(path)}` : "";
-  return `${base}${suffix}?ref=${encodeURIComponent(config.branch)}`;
-}
-
 function asObject(value: unknown): Record<string, unknown> | null {
   if (value && typeof value === "object" && !Array.isArray(value)) {
     return value as Record<string, unknown>;
@@ -818,6 +812,17 @@ async function githubRequest(
       payload && typeof payload === "object" && !Array.isArray(payload)
         ? String((payload as Record<string, unknown>).message || text || "unknown error")
         : String(text || "unknown error");
+    if (response.status === 403 && /rate limit exceeded/i.test(errorText)) {
+      const resetUnix = Number(response.headers.get("x-ratelimit-reset") || "0");
+      const remaining = response.headers.get("x-ratelimit-remaining") || "";
+      const resetAt = resetUnix > 0 ? utcNowText(new Date(resetUnix * 1000)) : "";
+      throw new Error(
+        `GitHub API 403: rate limit exceeded` +
+          (remaining ? ` (remaining=${remaining})` : "") +
+          (resetAt ? `，预计重置时间 ${resetAt}` : "") +
+          `。建议稍后重试，或减少单次操作规模。`
+      );
+    }
     throw new Error(`GitHub API ${response.status}: ${shortText(errorText, 500)}`);
   }
   return payload;
@@ -967,24 +972,6 @@ async function listRepoJsonFiles(config: NormalizedRepoConfig): Promise<RepoFile
   return files.sort((a, b) => a.path.localeCompare(b.path));
 }
 
-async function readRepoFileText(config: NormalizedRepoConfig, path: string): Promise<{ text: string; sha: string }> {
-  const payload = await githubRequest(config, buildRepoContentsUrl(config, path), "GET");
-  const obj = asObject(payload);
-  if (!obj || String(obj.type || "") !== "file") {
-    throw new Error(`仓库文件读取失败: ${path}`);
-  }
-  const content = String(obj.content || "").replace(/\n/g, "");
-  const encoding = String(obj.encoding || "");
-  const sha = String(obj.sha || "");
-  if (!content || encoding !== "base64") {
-    throw new Error(`仓库文件编码异常: ${path}`);
-  }
-  return {
-    text: Buffer.from(content, "base64").toString("utf8"),
-    sha
-  };
-}
-
 function joinRepoPath(subdir: string, filename: string): string {
   const safeSubdir = subdir.replace(/^\/+|\/+$/g, "");
   if (!safeSubdir) {
@@ -1054,6 +1041,72 @@ function pickMatchingRefs(
   return selected;
 }
 
+function trimToRepoRelativePath(zipPath: string): string {
+  const normalized = zipPath.replace(/^\/+/, "").replace(/\\/g, "/");
+  const firstSlash = normalized.indexOf("/");
+  if (firstSlash < 0) {
+    return "";
+  }
+  return normalized.slice(firstSlash + 1);
+}
+
+function isPathUnderDir(pathText: string, dir: string): boolean {
+  const normalizedPath = pathText.replace(/^\/+|\/+$/g, "");
+  const normalizedDir = dir.replace(/^\/+|\/+$/g, "");
+  if (!normalizedDir) {
+    return true;
+  }
+  return normalizedPath === normalizedDir || normalizedPath.startsWith(`${normalizedDir}/`);
+}
+
+async function fetchRepoZipball(config: NormalizedRepoConfig): Promise<Buffer> {
+  const url = buildRepoGitUrl(config, `/zipball/${encodeURIComponent(config.branch)}`);
+  const response = await fetch(url, {
+    method: "GET",
+    headers: {
+      Authorization: `Bearer ${config.githubToken}`,
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28"
+    },
+    signal: AbortSignal.timeout(GITHUB_TIMEOUT_MS)
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    const message = shortText(text, 500);
+    throw new Error(`仓库 zipball 下载失败 (HTTP ${response.status}): ${message}`);
+  }
+
+  return Buffer.from(await response.arrayBuffer());
+}
+
+async function collectRepoCredentialsFromZipball(config: NormalizedRepoConfig): Promise<CredentialInput[]> {
+  const zipBuffer = await fetchRepoZipball(config);
+  const zip = await JSZip.loadAsync(zipBuffer);
+  const credentials: CredentialInput[] = [];
+  const source = `repo:${config.owner}/${config.repo}@${config.branch}`;
+
+  for (const entry of Object.values(zip.files)) {
+    if (entry.dir || !entry.name.toLowerCase().endsWith(".json")) {
+      continue;
+    }
+
+    const repoRelativePath = trimToRepoRelativePath(entry.name);
+    if (!repoRelativePath || !isPathUnderDir(repoRelativePath, config.authSubdir)) {
+      continue;
+    }
+
+    credentials.push({
+      origin: "repo",
+      source,
+      path: repoRelativePath,
+      rawText: await entry.async("string")
+    });
+  }
+
+  return credentials.sort((a, b) => a.path.localeCompare(b.path));
+}
+
 export async function checkArchiveCredentials(
   archivesInput: ArchiveInput[],
   inputOptions: Partial<CheckOptions>
@@ -1067,25 +1120,14 @@ export async function checkGithubRepoCredentials(
   inputOptions: Partial<CheckOptions>
 ): Promise<CheckReport> {
   const config = normalizeRepoConfig(repoInput);
-  const entries = await listRepoJsonFiles(config);
-  if (entries.length === 0) {
+  const credentials = await collectRepoCredentialsFromZipball(config);
+  if (credentials.length === 0) {
     throw new Error(`仓库 ${config.owner}/${config.repo} 的 ${config.authSubdir} 下未找到 .json 凭证`);
   }
 
-  const options = normalizeOptions(inputOptions);
-  const credentials = await mapWithConcurrency(entries, Math.min(options.workers, 24), async (entry) => {
-    const file = await readRepoFileText(config, entry.path);
-    return {
-      origin: "repo" as const,
-      source: `repo:${config.owner}/${config.repo}@${config.branch}`,
-      path: entry.path,
-      rawText: file.text
-    };
-  });
-
   return checkCredentials(
     credentials,
-    options,
+    inputOptions,
     "repo",
     `repo:${config.owner}/${config.repo}@${config.branch}/${config.authSubdir}`
   );
@@ -1228,16 +1270,23 @@ export async function deleteCredentialsFromGithubRepo(
     return { deleted_paths: [], failed_paths: [] };
   }
 
+  const repoFiles = await listRepoJsonFiles(config);
+  const shaByPath = new Map(repoFiles.map((item) => [item.path, item.sha]));
+
   const deletedPaths: string[] = [];
   const failedPaths: string[] = [];
 
   for (const target of targets) {
     try {
-      const file = await readRepoFileText(config, target.path);
+      const targetSha = shaByPath.get(target.path);
+      if (!targetSha) {
+        failedPaths.push(target.path);
+        continue;
+      }
       const deleteUrl = `https://api.github.com/repos/${encodeURIComponent(config.owner)}/${encodeURIComponent(config.repo)}/contents/${encodeRepoPath(target.path)}`;
       await githubRequest(config, deleteUrl, "DELETE", {
         message: `delete credential by 2apicheck status=${target.status}`,
-        sha: file.sha,
+        sha: targetSha,
         branch: config.branch
       });
       deletedPaths.push(target.path);
