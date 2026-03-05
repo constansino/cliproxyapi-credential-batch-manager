@@ -120,6 +120,35 @@ async function parseApiResponse(response: Response): Promise<Record<string, unkn
   }
 }
 
+function chunkArray<T>(items: T[], size: number): T[][] {
+  const chunks: T[][] = [];
+  for (let index = 0; index < items.length; index += size) {
+    chunks.push(items.slice(index, index + size));
+  }
+  return chunks;
+}
+
+function collectTargetRefs(
+  report: CheckReport,
+  statuses: string[],
+  providerScope: ProviderScope,
+  origin: "upload" | "repo"
+): CleanupResultRef[] {
+  const statusSet = new Set(statuses.map((item) => item.trim().toLowerCase()).filter(Boolean));
+  return toResultRefs(report).filter((item) => {
+    if (item.origin !== origin) {
+      return false;
+    }
+    if (!statusSet.has(item.status.trim().toLowerCase())) {
+      return false;
+    }
+    if (providerScope === "codex" && item.provider.trim().toLowerCase() !== "codex") {
+      return false;
+    }
+    return true;
+  });
+}
+
 export default function HomePage(): React.ReactElement {
   const [archives, setArchives] = useState<File[]>([]);
   const [codexModel, setCodexModel] = useState("gpt-5");
@@ -132,7 +161,9 @@ export default function HomePage(): React.ReactElement {
   const [repoAuthSubdir, setRepoAuthSubdir] = useState("auths");
   const [githubToken, setGithubToken] = useState("");
 
-  const [report, setReport] = useState<CheckReport | null>(null);
+  const [uploadReport, setUploadReport] = useState<CheckReport | null>(null);
+  const [repoReport, setRepoReport] = useState<CheckReport | null>(null);
+  const [reportView, setReportView] = useState<"upload" | "repo">("upload");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [isCheckingUpload, setIsCheckingUpload] = useState(false);
@@ -151,7 +182,13 @@ export default function HomePage(): React.ReactElement {
   const [reasonKeyword, setReasonKeyword] = useState("");
   const [checkProgress, setCheckProgress] = useState(0);
   const [checkProgressLabel, setCheckProgressLabel] = useState("");
+  const [importProgress, setImportProgress] = useState(0);
+  const [importProgressLabel, setImportProgressLabel] = useState("");
 
+  const report = reportView === "upload" ? uploadReport : repoReport;
+  const hasAnyReport = Boolean(uploadReport || repoReport);
+  const activeProgress = importProgress > 0 ? importProgress : checkProgress;
+  const activeProgressLabel = importProgress > 0 ? importProgressLabel : checkProgressLabel;
   const statusKeys = useMemo(() => Object.keys(report?.summary.by_status || {}), [report]);
   const isChecking = isCheckingUpload || isCheckingRepo;
 
@@ -238,6 +275,16 @@ export default function HomePage(): React.ReactElement {
   }, [report, statusKeys]);
 
   useEffect(() => {
+    if (reportView === "upload" && !uploadReport && repoReport) {
+      setReportView("repo");
+      return;
+    }
+    if (reportView === "repo" && !repoReport && uploadReport) {
+      setReportView("upload");
+    }
+  }, [reportView, uploadReport, repoReport]);
+
+  useEffect(() => {
     if (!isCheckingRepo) {
       return;
     }
@@ -262,6 +309,15 @@ export default function HomePage(): React.ReactElement {
     const timer = window.setTimeout(() => setCheckProgress(0), 600);
     return () => window.clearTimeout(timer);
   }, [isChecking, checkProgress]);
+
+  useEffect(() => {
+    if (isImportingRepo || importProgress <= 0) {
+      return;
+    }
+    setImportProgress(100);
+    const timer = window.setTimeout(() => setImportProgress(0), 800);
+    return () => window.clearTimeout(timer);
+  }, [isImportingRepo, importProgress]);
 
   function pickUnavailableCodexStatuses(): void {
     if (!report) {
@@ -347,12 +403,12 @@ export default function HomePage(): React.ReactElement {
       }
 
       const mergedReport = mergeUploadReports(partialReports, codexModel, codexUsageLimitOnly);
-      setReport(mergedReport);
+      setUploadReport(mergedReport);
+      setReportView("upload");
       setNotice(`上传检查完成，共 ${mergedReport.total} 条凭证。`);
     } catch (err) {
       const message = err instanceof Error ? err.message : "检查失败";
       setError(message);
-      setReport(null);
     } finally {
       setIsCheckingUpload(false);
     }
@@ -384,18 +440,19 @@ export default function HomePage(): React.ReactElement {
       if (!response.ok) {
         throw new Error(String(payload?.error || "仓库检查失败"));
       }
-      setReport(payload as unknown as CheckReport);
+      const checkedReport = payload as unknown as CheckReport;
+      setRepoReport(checkedReport);
+      setReportView("repo");
       setNotice(`仓库检查完成，共 ${payload.total} 条凭证。`);
     } catch (err) {
       setError(err instanceof Error ? err.message : "仓库检查失败");
-      setReport(null);
     } finally {
       setIsCheckingRepo(false);
     }
   }
 
   async function downloadCleanedZip(): Promise<void> {
-    if (!report || report.mode !== "upload") {
+    if (!uploadReport) {
       setError("请先执行上传包检查");
       return;
     }
@@ -418,7 +475,7 @@ export default function HomePage(): React.ReactElement {
       }
       form.append("deleteStatuses", deleteStatuses.join(","));
       form.append("providerScope", providerScope);
-      form.append("resultRefs", JSON.stringify(toResultRefs(report)));
+      form.append("resultRefs", JSON.stringify(toResultRefs(uploadReport)));
 
       const response = await fetch("/api/cleanup", {
         method: "POST",
@@ -449,7 +506,7 @@ export default function HomePage(): React.ReactElement {
   }
 
   async function importToGithubRepo(): Promise<void> {
-    if (!report || report.mode !== "upload") {
+    if (!uploadReport) {
       setError("请先执行上传包检查");
       return;
     }
@@ -464,32 +521,85 @@ export default function HomePage(): React.ReactElement {
 
     setError("");
     setNotice("");
+    setImportProgressLabel("准备导入任务...");
+    setImportProgress(4);
     setIsImportingRepo(true);
     try {
       ensureRepoConfig();
-      const form = new FormData();
-      for (const archive of archives) {
-        form.append("archives", archive);
+      const targetRefs = collectTargetRefs(uploadReport, importStatuses, providerScope, "upload");
+      if (targetRefs.length === 0) {
+        throw new Error("当前条件下没有可导入的凭证，请调整导入状态或 provider 范围");
       }
-      form.append("repoUrl", repoUrl);
-      form.append("githubToken", githubToken);
-      form.append("branch", repoBranch);
-      form.append("authSubdir", repoAuthSubdir);
-      form.append("importStatuses", importStatuses.join(","));
-      form.append("providerScope", providerScope);
-      form.append("resultRefs", JSON.stringify(toResultRefs(report)));
 
-      const response = await fetch("/api/github/import", {
-        method: "POST",
-        body: form
-      });
-      const payload = await parseApiResponse(response);
-      if (!response.ok) {
-        throw new Error(String(payload?.error || "导入失败"));
+      const archiveByName = new Map<string, File>();
+      for (const archive of archives) {
+        if (!archiveByName.has(archive.name)) {
+          archiveByName.set(archive.name, archive);
+        }
       }
-      const importedCount = Array.isArray(payload.imported_paths) ? payload.imported_paths.length : 0;
-      const skippedCount = Array.isArray(payload.skipped_paths) ? payload.skipped_paths.length : 0;
-      setNotice(`导入完成：成功 ${importedCount}，跳过 ${skippedCount}。`);
+
+      const refsBySource = new Map<string, CleanupResultRef[]>();
+      for (const ref of targetRefs) {
+        if (!refsBySource.has(ref.source)) {
+          refsBySource.set(ref.source, []);
+        }
+        refsBySource.get(ref.source)!.push(ref);
+      }
+
+      const chunkSize = 180;
+      const tasks: Array<{ source: string; archive: File; refs: CleanupResultRef[] }> = [];
+      const skippedMissingSource: string[] = [];
+
+      for (const [source, refs] of refsBySource.entries()) {
+        const archive = archiveByName.get(source);
+        if (!archive) {
+          skippedMissingSource.push(source);
+          continue;
+        }
+        const chunks = chunkArray(refs, chunkSize);
+        for (const chunk of chunks) {
+          tasks.push({ source, archive, refs: chunk });
+        }
+      }
+
+      if (tasks.length === 0) {
+        throw new Error("导入任务为空：上传包名称与结果来源不匹配，请重新执行上传检查");
+      }
+
+      let importedCount = 0;
+      let skippedCount = 0;
+
+      for (let index = 0; index < tasks.length; index += 1) {
+        const task = tasks[index];
+        setImportProgressLabel(`导入进度 ${index + 1}/${tasks.length}（${task.source}）`);
+
+        const form = new FormData();
+        form.append("archives", task.archive);
+        form.append("repoUrl", repoUrl);
+        form.append("githubToken", githubToken);
+        form.append("branch", repoBranch);
+        form.append("authSubdir", repoAuthSubdir);
+        form.append("importStatuses", importStatuses.join(","));
+        form.append("providerScope", providerScope);
+        form.append("resultRefs", JSON.stringify(task.refs));
+
+        const response = await fetch("/api/github/import", {
+          method: "POST",
+          body: form
+        });
+        const payload = await parseApiResponse(response);
+        if (!response.ok) {
+          throw new Error(`第 ${index + 1}/${tasks.length} 批导入失败：${String(payload?.error || "未知错误")}`);
+        }
+
+        importedCount += Array.isArray(payload.imported_paths) ? payload.imported_paths.length : 0;
+        skippedCount += Array.isArray(payload.skipped_paths) ? payload.skipped_paths.length : 0;
+        setImportProgress(Math.min(98, Math.max(8, Math.round(((index + 1) / tasks.length) * 98))));
+      }
+
+      skippedCount += skippedMissingSource.length;
+      const sourceWarn = skippedMissingSource.length > 0 ? `，另有 ${skippedMissingSource.length} 个来源包未匹配` : "";
+      setNotice(`导入完成：成功 ${importedCount}，跳过 ${skippedCount}${sourceWarn}。`);
     } catch (err) {
       setError(err instanceof Error ? err.message : "导入失败");
     } finally {
@@ -498,7 +608,7 @@ export default function HomePage(): React.ReactElement {
   }
 
   async function deleteFromGithubRepo(): Promise<void> {
-    if (!report || report.mode !== "repo") {
+    if (!repoReport) {
       setError("请先执行仓库检查");
       return;
     }
@@ -522,7 +632,7 @@ export default function HomePage(): React.ReactElement {
           authSubdir: repoAuthSubdir,
           deleteStatuses: deleteStatuses.join(","),
           providerScope,
-          resultRefs: toResultRefs(report)
+          resultRefs: toResultRefs(repoReport)
         })
       });
       const payload = await parseApiResponse(response);
@@ -644,14 +754,14 @@ export default function HomePage(): React.ReactElement {
         </div>
       </section>
 
-      {checkProgress > 0 ? (
+      {activeProgress > 0 ? (
         <section className="panel progress-panel">
           <div className="progress-head">
-            <strong>{checkProgressLabel || "检查中..."}</strong>
-            <span>{Math.round(checkProgress)}%</span>
+            <strong>{activeProgressLabel || "处理中..."}</strong>
+            <span>{Math.round(activeProgress)}%</span>
           </div>
           <div className="progress-track">
-            <div className="progress-fill" style={{ width: `${checkProgress}%` }} />
+            <div className="progress-fill" style={{ width: `${activeProgress}%` }} />
           </div>
         </section>
       ) : null}
@@ -659,8 +769,20 @@ export default function HomePage(): React.ReactElement {
       {error ? <p className="error-text">{error}</p> : null}
       {notice ? <p className="ok-text">{notice}</p> : null}
 
-      {report ? (
+      {hasAnyReport && report ? (
         <>
+          <section className="panel">
+            <h2>结果视图</h2>
+            <div className="cleanup-row">
+              <button className="btn" type="button" onClick={() => setReportView("upload")} disabled={!uploadReport}>
+                上传结果（{uploadReport?.total ?? 0}）
+              </button>
+              <button className="btn" type="button" onClick={() => setReportView("repo")} disabled={!repoReport}>
+                仓库结果（{repoReport?.total ?? 0}）
+              </button>
+            </div>
+          </section>
+
           <section className="panel">
             <h2>检查结果</h2>
             <p>
@@ -731,7 +853,7 @@ export default function HomePage(): React.ReactElement {
                 className="btn btn-danger"
                 type="button"
                 onClick={downloadCleanedZip}
-                disabled={isCleaning || report.mode !== "upload"}
+                disabled={isCleaning || !uploadReport}
               >
                 {isCleaning ? "打包中..." : "下载清理后 ZIP（上传包）"}
               </button>
@@ -739,7 +861,7 @@ export default function HomePage(): React.ReactElement {
                 className="btn btn-main"
                 type="button"
                 onClick={importToGithubRepo}
-                disabled={isImportingRepo || report.mode !== "upload"}
+                disabled={isImportingRepo || !uploadReport}
               >
                 {isImportingRepo ? "导入中..." : "一键导入到 GitHub 仓库"}
               </button>
@@ -747,7 +869,7 @@ export default function HomePage(): React.ReactElement {
                 className="btn btn-danger"
                 type="button"
                 onClick={deleteFromGithubRepo}
-                disabled={isDeletingRepo || report.mode !== "repo"}
+                disabled={isDeletingRepo || !repoReport}
               >
                 {isDeletingRepo ? "删除中..." : "删除仓库中选中状态凭证"}
               </button>
