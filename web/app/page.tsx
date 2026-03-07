@@ -13,6 +13,9 @@ const DEFAULT_DELETE_STATUSES = [
 ];
 const DEFAULT_IMPORT_STATUSES = ["usage_not_limited", "active"];
 const TABLE_LIMIT = 200;
+const THEME_STORAGE_KEY = "cliproxyapi-theme";
+
+type ThemeMode = "warm-light" | "pure-white";
 
 function utcNowText(date: Date = new Date()): string {
   return date.toISOString().replace("T", " ").replace(/\.\d{3}Z$/, " UTC");
@@ -151,6 +154,7 @@ function collectTargetRefs(
 
 export default function HomePage(): React.ReactElement {
   const [archives, setArchives] = useState<File[]>([]);
+  const [themeMode, setThemeMode] = useState<ThemeMode>("warm-light");
   const [codexModel, setCodexModel] = useState("gpt-5");
   const [timeoutSeconds, setTimeoutSeconds] = useState(35);
   const [workers, setWorkers] = useState(200);
@@ -273,6 +277,26 @@ export default function HomePage(): React.ReactElement {
     setReasonFilter("all");
     setReasonKeyword("");
   }, [report, statusKeys]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    const saved = window.localStorage.getItem(THEME_STORAGE_KEY);
+    if (saved === "pure-white" || saved === "warm-light") {
+      setThemeMode(saved);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (typeof document === "undefined") {
+      return;
+    }
+    document.documentElement.setAttribute("data-theme", themeMode);
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem(THEME_STORAGE_KEY, themeMode);
+    }
+  }, [themeMode]);
 
   useEffect(() => {
     if (reportView === "upload" && !uploadReport && repoReport) {
@@ -657,6 +681,15 @@ export default function HomePage(): React.ReactElement {
         <p className="hero-label">2ApiCheck</p>
         <h1>多包检查 + GitHub 仓库管理</h1>
         <p>支持多 ZIP 上传检查、可用凭证一键导入仓库、仓库现有凭证状态检查与批量删除。</p>
+        <div className="theme-row">
+          <label className="scope-select">
+            <span>界面主题</span>
+            <select value={themeMode} onChange={(event) => setThemeMode(event.target.value as ThemeMode)}>
+              <option value="warm-light">浅暖色（默认）</option>
+              <option value="pure-white">纯白色</option>
+            </select>
+          </label>
+        </div>
         <p className="feedback-tip">
           有问题可反馈：
           <a href="https://aiya.de5.net/c/26-category/26" target="_blank" rel="noreferrer">

@@ -1,6 +1,8 @@
 :root {
   --bg: #fffaf0;
   --bg-accent: #eaf7ff;
+  --bg-glow-left: #f8d7a633;
+  --bg-glow-right: #72d3ff22;
   --panel: #ffffffcc;
   --line: #d3dbe0;
   --text: #14222e;
@@ -9,6 +11,17 @@
   --warn: #d47f00;
   --bad: #cb2e49;
   --main: #0d6ecf;
+  --hero-backdrop: conic-gradient(from 180deg, #ffd89b55, #98daff44, #ffd89b55);
+}
+
+:root[data-theme="pure-white"] {
+  --bg: #ffffff;
+  --bg-accent: #ffffff;
+  --bg-glow-left: transparent;
+  --bg-glow-right: transparent;
+  --panel: #ffffff;
+  --line: #d7dde3;
+  --hero-backdrop: none;
 }
 
 * {
@@ -22,8 +35,8 @@ body {
   min-height: 100%;
   color: var(--text);
   background:
-    radial-gradient(65% 45% at 10% 0%, #f8d7a633 0%, transparent 70%),
-    radial-gradient(60% 40% at 100% 10%, #72d3ff22 0%, transparent 70%),
+    radial-gradient(65% 45% at 10% 0%, var(--bg-glow-left) 0%, transparent 70%),
+    radial-gradient(60% 40% at 100% 10%, var(--bg-glow-right) 0%, transparent 70%),
     linear-gradient(160deg, var(--bg), var(--bg-accent));
   font-family:
     "Avenir Next",
@@ -49,7 +62,7 @@ body {
   width: 220px;
   height: 220px;
   border-radius: 999px;
-  background: conic-gradient(from 180deg, #ffd89b55, #98daff44, #ffd89b55);
+  background: var(--hero-backdrop);
   filter: blur(20px);
   animation: spin 18s linear infinite;
 }
@@ -99,6 +112,10 @@ body {
 .hero p {
   margin: 0;
   color: var(--muted);
+}
+
+.theme-row {
+  margin-top: 10px;
 }
 
 .feedback-tip {
