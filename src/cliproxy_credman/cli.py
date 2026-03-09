@@ -64,6 +64,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--git-author-name", default="", help="Git commit author name")
     parser.add_argument("--git-author-email", default="", help="Git commit author email")
     parser.add_argument("--interactive", action="store_true", help="Interactive mode: choose deletion after scan")
+    parser.add_argument(
+        "--enable-valid-configs",
+        action="store_true",
+        help="Enable active codex configs instead of deleting (local/repo modes only)",
+    )
     parser.add_argument("--schedule-minutes", type=int, default=0, help="Run scan periodically every N minutes")
     parser.add_argument("--tg-bot-token", default="", help="Telegram bot token for notifications")
     parser.add_argument("--tg-chat-id", default="", help="Telegram chat id for notifications")
@@ -899,6 +904,46 @@ def delete_credentials_local_by_names(
     return deleted
 
 
+def enable_active_codex_configs(results: List[CheckResult]) -> List[str]:
+    enabled: List[str] = []
+    for item in results:
+        file_name = item.file
+        if item.http_status != 200:
+            continue
+        path_text = item.path
+        if not path_text:
+            continue
+        file_path = Path(path_text)
+        if not file_path.exists():
+            continue
+        try:
+            data = json.loads(file_path.read_text(encoding="utf-8"))
+        except Exception as error:
+            print(f"skip enable: {file_name}, invalid json: {short_text(repr(error), 200)}")
+            continue
+        f_type = data.get("type")
+        if f_type != "codex":
+            continue
+        nested_token = nested_token_object(data)
+        target_obj = data if "disabled" in data else nested_token if "disabled" in nested_token else data
+        current_disabled = target_obj.get("disabled")
+        if current_disabled is False:
+            continue
+        target_obj["disabled"] = False
+        try:
+            file_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            enabled.append(file_name)
+        except Exception as error:
+            print(f"failed to write {file_name}: {short_text(repr(error), 200)}")
+    if enabled:
+        print(f"启用了 {len(enabled)} 个 codex 配置：")
+        for name in enabled:
+            print(f"- {name}")
+    else:
+        print("没有符合条件的 codex 配置需要启用。")
+    return enabled
+
+
 def git_push_with_fallback(repo_dir: Path, git_env: Dict[str, str]) -> None:
     branch = ""
     try:
@@ -959,6 +1004,7 @@ def git_commit_and_push(
     author_name: str,
     author_email: str,
     delete_statuses: List[str],
+    enabled_files: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     outcome: Dict[str, Any] = {
         "committed": False,
@@ -981,7 +1027,10 @@ def git_commit_and_push(
             commit_env["GIT_AUTHOR_EMAIL"] = author_email
             commit_env["GIT_COMMITTER_EMAIL"] = author_email
 
-        message = f"cleanup auth credentials by status: {','.join(delete_statuses)}"
+        if enabled_files:
+            message = "enable active codex configs"
+        else:
+            message = f"cleanup auth credentials by status: {','.join(delete_statuses)}"
         run_command(["git", "commit", "-m", message], cwd=repo_dir, env=commit_env)
         commit_id = run_command(["git", "rev-parse", "HEAD"], cwd=repo_dir, env=git_env)
         outcome["committed"] = True
@@ -1012,6 +1061,8 @@ def print_summary(report: Dict[str, Any]) -> None:
     print("status counts:")
     for status, count in report["summary"]["by_status"].items():
         print(f"  - {status}: {count}")
+    if report.get("enabled_files"):
+        print(f"enabled: {len(report['enabled_files'])}")
     if report["deleted_files"]:
         print(f"deleted: {len(report['deleted_files'])}")
     push_error = str(report.get("git", {}).get("push_error") or "").strip()
@@ -1105,39 +1156,69 @@ def apply_menu_configuration(args: argparse.Namespace) -> argparse.Namespace:
     else:
         args.schedule_minutes = 0
 
-    delete_mode = prompt_choice(
-        "删除策略",
-        [
-            ("1", "不删除，只检测"),
-            ("2", "检测后交互选择删除状态"),
-            ("3", "固定状态自动删除/预演"),
-        ],
-        "2",
-    )
+    delete_mode_options = [
+        ("1", "不删除，只检测"),
+        ("2", "检测后交互选择删除状态"),
+        ("3", "固定状态自动删除/预演"),
+        ("4", "检测并启用有效配置"),
+    ]
 
     args.delete_statuses = ""
     args.dry_run = False
     args.interactive = False
+    args.enable_valid_configs = False
 
-    if delete_mode == "2":
-        if args.schedule_minutes > 0:
-            print("定时模式不支持交互删除，已切换为固定状态 dry-run。")
-            args.delete_statuses = default_delete_statuses
-            args.dry_run = True
+    while True:
+        delete_mode = prompt_choice("删除策略", delete_mode_options, "4")
+
+        if delete_mode == "4":
+            if mode == "2":
+                print("CPA 模式不支持启用有效配置，请选择其他策略。")
+                continue
+            if args.schedule_minutes > 0:
+                print("定时运行不支持启用有效配置，请选择其他策略。")
+                continue
+            print("将仅启用检测为可用的 codex 配置（不会删除文件）。")
+            args.enable_valid_configs = True
+            break
+
+        if delete_mode == "2":
+            if args.schedule_minutes > 0:
+                print("定时模式不支持交互删除，已切换为固定状态 dry-run。")
+                args.delete_statuses = default_delete_statuses
+                args.dry_run = True
+            else:
+                args.interactive = True
+            break
+
+        if delete_mode == "3":
+            args.delete_statuses = prompt_input(
+                "输入要处理的状态（逗号分隔）",
+                default_delete_statuses,
+            )
+            args.dry_run = prompt_yes_no("是否 dry-run（只预演不删除）？", default_no=False)
+            break
+
+        # delete_mode == "1"
+        break
+
+    if args.enable_valid_configs:
+        if mode == "1":
+            args.git_commit = prompt_yes_no("启用后是否 git commit？", default_no=False)
+            args.git_push = prompt_yes_no("启用后是否 git push？", default_no=False)
         else:
-            args.interactive = True
-    elif delete_mode == "3":
-        args.delete_statuses = prompt_input(
-            "输入要处理的状态（逗号分隔）",
-            default_delete_statuses,
-        )
-        args.dry_run = prompt_yes_no("是否 dry-run（只预演不删除）？", default_no=False)
-
-    if mode == "1" and args.delete_statuses and not args.dry_run:
+            args.git_commit = False
+            args.git_push = False
+    elif mode == "1" and args.delete_statuses and not args.dry_run:
         args.git_commit = prompt_yes_no("删除后是否 git commit？", default_no=False)
         args.git_push = prompt_yes_no("删除后是否 git push？", default_no=False)
+    else:
+        args.git_commit = False
+        args.git_push = False
 
     print("\n菜单配置完成，开始执行...\n")
+    if args.enable_valid_configs:
+        print("当前模式：检测并启用可用的 codex 配置，不进行删除操作。")
     return args
 
 
@@ -1431,9 +1512,26 @@ def run_once(args: argparse.Namespace) -> Dict[str, Any]:
         delete_statuses = parse_delete_statuses(args.delete_statuses)
         run_dry_run = bool(args.dry_run)
         deleted_files: List[str] = []
+        enabled_files: List[str] = []
         git_result: Dict[str, Any] = {"committed": False, "pushed": False, "commit_id": "", "push_error": ""}
 
-        if args.interactive:
+        if args.enable_valid_configs:
+            if cpa_mode:
+                raise ValueError("enable-valid-configs cannot be used with CPA mode")
+            enabled_files = enable_active_codex_configs(results)
+            if repo_mode and enabled_files:
+                git_result = git_commit_and_push(
+                    repo_dir=repo_dir,
+                    git_env=git_env or dict(os.environ),
+                    do_commit=args.git_commit,
+                    do_push=args.git_push,
+                    author_name=args.git_author_name,
+                    author_email=args.git_author_email,
+                    delete_statuses=[],
+                    enabled_files=enabled_files,
+                )
+            deleted_files = []
+        elif args.interactive:
             delete_statuses, deleted_files, git_result, run_dry_run = interactive_manage_and_delete(
                 args=args,
                 results=results,
@@ -1498,6 +1596,7 @@ def run_once(args: argparse.Namespace) -> Dict[str, Any]:
             "delete_statuses": delete_statuses,
             "dry_run": run_dry_run,
             "deleted_files": deleted_files,
+            "enabled_files": enabled_files,
             "git": git_result,
             "results": [asdict(result) for result in results],
         }
@@ -1517,6 +1616,14 @@ def main() -> None:
         raise ValueError("--schedule-minutes must be >= 0")
     if args.schedule_minutes > 0 and args.interactive:
         raise ValueError("--interactive cannot be used with --schedule-minutes")
+    if args.enable_valid_configs and args.schedule_minutes > 0:
+        raise ValueError("--enable-valid-configs cannot be used with --schedule-minutes")
+    if args.enable_valid_configs and args.interactive:
+        raise ValueError("--enable-valid-configs cannot be used with --interactive")
+    if args.enable_valid_configs and parse_delete_statuses(args.delete_statuses):
+        raise ValueError("--enable-valid-configs cannot be combined with --delete-statuses")
+    if args.enable_valid_configs and args.cpa_url:
+        raise ValueError("--enable-valid-configs is not supported with --cpa-url")
 
     report_path = Path(args.report_file).expanduser().resolve()
     report_path.parent.mkdir(parents=True, exist_ok=True)
